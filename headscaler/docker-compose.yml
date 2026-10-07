@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  headscale:
+    image: headscale/headscale:latest
+    container_name: headscale-server
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+    volumes:
+      - ./config:/etc/headscale
+      - ./data:/var/lib/headscale
+    command: headscale serve
+    restart: unless-stopped
