@@ -4,14 +4,17 @@ const os = require('os');
 const crypto = require('crypto');
 const { io } = require('socket.io-client');
 
+// Base de dados do daemon: UBIKA_BASE_DIR (launcher/exe) > pasta do script
+const BASE_DIR = process.env.UBIKA_BASE_DIR || __dirname;
+
 // Carrega .env ao lado do script (Node >=20.12); ignora se não existir
-try { process.loadEnvFile(path.join(__dirname, '.env')); } catch {}
+try { process.loadEnvFile(path.join(BASE_DIR, '.env')); } catch {}
 
 const { loadLibrary, searchLibrary, syncSources, watchLibrary, DIR_LIBRARY } = require('./library');
 const { DownloadManager, defaultDownloadDir } = require('./downloads');
 const sunshine = require('./sunshine');
 
-const ENV_PATH = path.join(__dirname, '.env');
+const ENV_PATH = path.join(BASE_DIR, '.env');
 const envUserId = (process.env.UBIKA_USER_ID || '').trim();
 // Sem usuário real (ou o id de teste) o daemon entra em modo de pareamento
 const PAIRED = envUserId && envUserId !== 'utilizador_teste_123';
@@ -260,7 +263,7 @@ if (!PAIRED) {
     '',
   ].join('\n');
   console.log(banner);
-  try { fs.writeFileSync(path.join(__dirname, 'PAREAR.txt'), `Código de pareamento Ubika: ${PAIR_CODE}\nVálido por 10 minutos. Digite no app mobile.\n`); } catch {}
+  try { fs.writeFileSync(path.join(BASE_DIR, 'PAREAR.txt'), `Código de pareamento Ubika: ${PAIR_CODE}\nVálido por 10 minutos. Digite no app mobile.\n`); } catch {}
 }
 
 log(`🟢 Ubika PC Daemon ativo user=${USER_ID || '(aguardando pareamento)'} device=${DEVICE_ID} streamHost=${STREAM_HOST || 'n/a'} engine=${downloads.engineName} dir=${downloadDir}`);

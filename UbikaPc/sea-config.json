@@ -1,0 +1,7 @@
+{
+  "main": "build/ubika-pc.cjs",
+  "output": "build/ubika-pc.blob",
+  "disableExperimentalSEAWarning": true,
+  "useSnapshot": false,
+  "useCodeCache": false
+}

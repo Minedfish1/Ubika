@@ -3,7 +3,7 @@ const path = require('path');
 const { execSync } = require('child_process');
 
 const log = (...args) => console.log(new Date().toISOString(), ...args);
-const STREAM_DIR = path.join(__dirname, 'stream');
+const STREAM_DIR = path.join(process.env.UBIKA_BASE_DIR || __dirname, 'stream');
 const ATTACH_PS1 = path.join(STREAM_DIR, 'display-attach.ps1');
 const DETACH_PS1 = path.join(STREAM_DIR, 'display-detach.ps1');
 

@@ -2,8 +2,9 @@ const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
 
-const DIR_LIBRARY = path.join(__dirname, 'library');
-const FILE_SOURCES = path.join(__dirname, 'sources.json');
+const BASE_DIR = process.env.UBIKA_BASE_DIR || __dirname;
+const DIR_LIBRARY = path.join(BASE_DIR, 'library');
+const FILE_SOURCES = path.join(BASE_DIR, 'sources.json');
 const PAGE_SIZE = 15;
 const FALLBACK_COVER = 'https://i.imgur.com/vHq0rDk.png';
 
