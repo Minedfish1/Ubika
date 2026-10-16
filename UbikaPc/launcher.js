@@ -52,14 +52,56 @@ function isProcessRunning(name) {
   } catch { return false; }
 }
 
-function tailscaleIp() {
+const TS_EXE = 'C:\\Program Files\\Tailscale\\tailscale.exe';
+const HEADSCALE_URL = (process.env.UBIKA_HEADSCALE_URL || 'http://18.223.108.137:8080').replace(/\/+$/, '');
+const HEADSCALE_KEY = process.env.UBIKA_HEADSCALE_KEY || '';
+const OFFICIAL_CONTROL = 'controlplane.tailscale.com';
+
+function tsRun(args) {
   try {
-    const exe = 'C:\\Program Files\\Tailscale\\tailscale.exe';
-    if (fs.existsSync(exe)) {
-      const out = execSync(`"${exe}" ip -4`, { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
-      return out.split(/\r?\n/)[0] || '';
-    }
-  } catch {}
+    return execSync(`"${TS_EXE}" ${args}`, { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
+  } catch { return ''; }
+}
+
+function tailscaleState() {
+  if (!fs.existsSync(TS_EXE)) return { installed: false, control: '', ip: '' };
+  let control = '';
+  try { control = JSON.parse(tsRun('debug prefs') || '{}').ControlURL || ''; } catch {}
+  const ip = tsRun('ip -4').split(/\r?\n/)[0] || '';
+  return { installed: true, control, ip };
+}
+
+/** Garante que o cliente está na headscale da VPS; troca se houver key. */
+function ensureHeadscale() {
+  const st = tailscaleState();
+  if (!st.installed) {
+    console.log('  …   Tailscale  não instalado — instale tailscale.com/download');
+    return '';
+  }
+  const onHeadscale = st.control.replace(/\/+$/, '') === HEADSCALE_URL;
+
+  if (onHeadscale && st.ip) return st.ip;
+
+  if (onHeadscale && !st.ip) {
+    console.log('  …   Headscale  conectado mas sem IP — rode tailscale up');
+    tsRun('up');
+    return tailscaleState().ip;
+  }
+
+  // Está em outro servidor (oficial ou headscale antiga): troca se tiver key
+  if (HEADSCALE_KEY) {
+    console.log(`  …   Trocando para headscale ${HEADSCALE_URL}…`);
+    tsRun('logout');
+    const out = tsRun(`login --login-server ${HEADSCALE_URL} --authkey ${HEADSCALE_KEY}`);
+    const ip = tailscaleState().ip;
+    if (ip) return ip;
+    console.log(`  !   Login falhou: ${out || 'sem resposta'}`);
+    return '';
+  }
+
+  console.log(`  …   Tailscale  está em ${st.control || 'desconectado'} — não é a headscale da VPS`);
+  console.log(`      → Rode:  "${TS_EXE}" login --login-server ${HEADSCALE_URL} --authkey <PREAUTHKEY>`);
+  console.log('      → ou defina UBIKA_HEADSCALE_KEY no .env para eu fazer isso sozinho');
   return '';
 }
 
@@ -70,9 +112,9 @@ function openUrl(url) {
 banner();
 log(`base=${BASE_DIR} sea=${isSea}`);
 
-// ---------- Tailscale ----------
-const tsIp = tailscaleIp();
-console.log(`  ${ok(!!tsIp)} Tailscale  ${tsIp || 'não conectado — faça login no Tailscale (ou headscale)'}`);
+// ---------- Overlay (headscale na VPS) ----------
+const tsIp = ensureHeadscale();
+console.log(`  ${ok(!!tsIp)} Headscale  ${tsIp || 'sem overlay — stream externo não funciona'}`);
 if (tsIp) process.env.UBIKA_STREAM_HOST = process.env.UBIKA_STREAM_HOST || tsIp;
 
 // ---------- Sunshine / VDD ----------
