@@ -118,6 +118,7 @@ class DownloadManager {
   add({ magnet, link, gameName }) {
     magnet = String(magnet || '').trim();
     link = String(link || '').trim();
+    if (magnet.startsWith('magnet:')) magnet = withOpenTrackers(magnet);
     const targetDir = this._gameDir(gameName);
     fs.mkdirSync(targetDir, { recursive: true });
 
@@ -403,6 +404,27 @@ class DownloadManager {
 }
 
 const B32_ALPHABET = 'abcdefghijklmnopqrstuvwxyz234567';
+
+// Trackers públicos abertos — as fontes do catálogo às vezes trazem trackers
+// privados que respondem "torrent not registered" e o download morre sem peer.
+// Anexar trackers abertos + DHT faz o magnet achar peers mesmo assim.
+const OPEN_TRACKERS = [
+  'udp://tracker.opentrackr.org:1337/announce',
+  'udp://open.stealth.si:80/announce',
+  'udp://tracker.openbittorrent.com:6969/announce',
+  'udp://exodus.desync.com:6969/announce',
+  'udp://tracker.daemon.org:6969/announce',
+  'udp://opentracker.i2p.rocks:6969/announce',
+  'udp://explodie.org:6969/announce',
+];
+
+function withOpenTrackers(magnet) {
+  if (!magnet.startsWith('magnet:')) return magnet;
+  const lower = magnet.toLowerCase();
+  const add = OPEN_TRACKERS.filter(t => !lower.includes(encodeURIComponent(t)))
+    .map(t => `tr=${encodeURIComponent(t)}`);
+  return add.length ? `${magnet}&${add.join('&')}` : magnet;
+}
 
 function extractInfoHash(magnet) {
   const m = /xt=urn:btih:([a-zA-Z0-9]+)/i.exec(magnet);

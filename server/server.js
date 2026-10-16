@@ -130,7 +130,9 @@ async function rawgEnrich(game) {
   if (!RAWG_API_KEY || !game?.title) return game;
   // FALLBACK_COVER não conta como capa real — antes ela vencia a imagem do RAWG
   const hasCover = Boolean(game.coverUrl) && game.coverUrl !== FALLBACK_COVER;
-  const hasDesc = Boolean(game.description) && game.description !== 'Sem descrição disponível.';
+  const hasDesc = Boolean(game.description)
+    && game.description !== 'Sem descrição disponível.'
+    && game.description !== 'Destaque popular.';
   const hasReq = Boolean(game.requirements);
   if (hasCover && hasDesc && hasReq) return game;
 
@@ -143,10 +145,17 @@ async function rawgEnrich(game) {
   if (meta) {
     // Capa aponta pra /covers/ na VPS — espelha no disco no 1º acesso
     const localCover = meta.coverUrl ? `${PUBLIC_URL}/covers/${mkey.replace(/\s+/g, '-')}.jpg` : null;
+    // Já tem descrição em inglês mas ainda não traduzida? traduz em background pra próxima vez
+    if (!meta.descriptionPt && meta.description) {
+      descriptionPtFor(game.title, meta.description).then(pt => {
+        if (pt && pt !== meta.description)
+          dbRun('UPDATE game_meta SET descriptionPt = ? WHERE key = ?', pt, mkey).catch(() => {});
+      }).catch(() => {});
+    }
     return {
       ...game,
       coverUrl: hasCover ? game.coverUrl : (localCover || FALLBACK_COVER),
-      description: hasDesc ? game.description : (meta.description || 'Sem descrição disponível.'),
+      description: hasDesc ? game.description : (meta.descriptionPt || meta.description || 'Sem descrição disponível.'),
       requirements: hasReq ? game.requirements : (meta.requirements || null),
     };
   }
@@ -186,14 +195,18 @@ async function rawgEnrich(game) {
   if (!game.requirements && !reqText) reqText = await steamRequirements(searchTitle);
 
   const remoteCover = hasCover ? game.coverUrl : (r.background_image || null);
-  const description = hasDesc ? game.description : (r.description_raw || 'Sem descrição disponível.');
+  const descriptionEn = hasDesc ? game.description : (r.description_raw || 'Sem descrição disponível.');
   const requirements = game.requirements || reqText || null;
+  // Descrição no idioma do usuário (pt-BR) — Steam l=brazilian ou tradução, grava 1x
+  const descriptionPt = descriptionEn !== 'Sem descrição disponível.' ? await descriptionPtFor(searchTitle, descriptionEn) : null;
+  const description = descriptionPt || descriptionEn;
 
   // Persiste no SQLite — próximas buscas desse jogo saem do DB, sem rede
   if (remoteCover || description !== 'Sem descrição disponível.' || requirements) {
-    dbRun('INSERT OR REPLACE INTO game_meta (key,coverUrl,description,requirements,updatedAt) VALUES (?,?,?,?,?)',
+    dbRun('INSERT OR REPLACE INTO game_meta (key,coverUrl,description,descriptionPt,requirements,updatedAt) VALUES (?,?,?,?,?,?)',
       mkey, remoteCover !== FALLBACK_COVER ? remoteCover : null,
-      description !== 'Sem descrição disponível.' ? description : null,
+      descriptionEn !== 'Sem descrição disponível.' ? descriptionEn : null,
+      descriptionPt !== descriptionEn ? descriptionPt : null,
       requirements, Date.now()
     ).catch(err => log(`[META] gravação falhou: ${err.message}`));
   }
@@ -207,6 +220,65 @@ async function rawgEnrich(game) {
 
 const stripHtml = s => String(s || '').replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/\s{2,}/g, ' ').trim();
 
+/** Descrição em pt-BR: 1º Steam appdetails l=brazilian (texto real localizado),
+ *  senão MyMemory traduz o EN. Falha → devolve o EN mesmo. */
+async function descriptionPtFor(title, enText) {
+  try {
+    const appid = await steamAppId(title);
+    if (appid) {
+      const d = await axios.get('https://store.steampowered.com/api/appdetails', {
+        params: { appids: appid, l: 'brazilian' }, timeout: 6000,
+      });
+      const pt = stripHtml(d.data?.[appid]?.data?.short_description || '');
+      if (pt.length > 20) return pt;
+    }
+  } catch { /* segue pro fallback */ }
+  return translatePt(enText);
+}
+
+/** Fallback de tradução EN→pt-BR via MyMemory (grátis, ~50k chars/dia com email). */
+async function translatePt(text) {
+  const t = String(text || '').trim();
+  if (!t || t.length < 8) return t;
+  const key = `tr:${crypto.createHash('md5').update(t).digest('hex')}`;
+  if (!rawgCache.has(key)) {
+    rawgCache.set(key, (async () => {
+      try {
+        const r = await axios.get('https://api.mymemory.translated.net/get', {
+          params: { q: t.slice(0, 450), langpair: 'en|pt-BR' },
+          timeout: 8000,
+        });
+        const out = String(r.data?.responseData?.translatedText || '');
+        return out.length > 10 ? out : t;
+      } catch { return t; }
+    })());
+  }
+  return rawgCache.get(key);
+}
+
+/** appid do Steam pro título (storesearch, com retry no título curto). Cacheado. */
+function steamAppId(title) {
+  if (!title) return Promise.resolve(null);
+  const key = `steamid:${title.toLowerCase()}`;
+  if (!rawgCache.has(key)) {
+    rawgCache.set(key, (async () => {
+      try {
+        for (const term of [title, title.split(':')[0].trim()]) {
+          if (!term) continue;
+          const s = await axios.get('https://store.steampowered.com/api/storesearch/', {
+            params: { term, cc: 'us', l: 'english' }, timeout: 6000,
+          });
+          const appid = s.data?.items?.[0]?.id;
+          if (appid) return appid;
+          if (term === title) break;
+        }
+        return null;
+      } catch { return null; }
+    })());
+  }
+  return rawgCache.get(key);
+}
+
 /** Busca requisitos de PC na Steam: storesearch -> appdetails. Cacheado por título. */
 async function steamRequirements(title) {
   if (!title) return null;
@@ -214,20 +286,7 @@ async function steamRequirements(title) {
   if (!rawgCache.has(key)) {
     rawgCache.set(key, (async () => {
       try {
-        let s = await axios.get('https://store.steampowered.com/api/storesearch/', {
-          params: { term: title, cc: 'us', l: 'english' }, timeout: 6000,
-        });
-        let appid = s.data?.items?.[0]?.id;
-        if (!appid) {
-          // retry com título curto (antes do ":", sem restos de versão)
-          const short = title.split(':')[0].trim();
-          if (short !== title) {
-            s = await axios.get('https://store.steampowered.com/api/storesearch/', {
-              params: { term: short, cc: 'us', l: 'english' }, timeout: 6000,
-            });
-            appid = s.data?.items?.[0]?.id;
-          }
-        }
+        const appid = await steamAppId(title);
         if (!appid) return null;
         const d = await axios.get('https://store.steampowered.com/api/appdetails', {
           params: { appids: appid }, timeout: 6000,
@@ -339,9 +398,11 @@ db.serialize(() => {
     key TEXT PRIMARY KEY,
     coverUrl TEXT,
     description TEXT,
+    descriptionPt TEXT,
     requirements TEXT,
     updatedAt INTEGER
   )`);
+  db.run(`ALTER TABLE game_meta ADD COLUMN descriptionPt TEXT`, () => {});
 });
 
 // PCs aguardando pareamento: code -> { socketId, deviceId, streamHost, expiresAt }
@@ -774,7 +835,7 @@ app.get('/api/trending', authHttp, async (req, res) => {
 
     const result = await axios.get('https://api.rawg.io/api/games', { params, timeout: 8000 });
 
-    const games = (result.data?.results || []).map((g) => sanitizeGame({
+    const base = (result.data?.results || []).map((g) => sanitizeGame({
       id: g.id,
       title: g.name,
       coverUrl: g.background_image,
@@ -782,6 +843,9 @@ app.get('/api/trending', authHttp, async (req, res) => {
       versions: [],
       installed: false,
     }, 1, 0));
+
+    // Enriquece igual à busca: descrição real + pt-BR, tudo cacheado no game_meta
+    const games = await Promise.all(base.map(g => rawgEnrich(g)));
 
     trendingCache[cacheKey] = { games, ts: Date.now() };
     log(`[TRENDING] ${games.length} jogos RAWG${genreKey ? ` (${genreKey})` : ''}`);

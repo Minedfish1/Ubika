@@ -122,10 +122,15 @@ function scheduleReload() {
 
 /** Chave de agrupamento: título limpo de versão/DLCs — junta a mesma obra de várias fontes. */
 function groupKey(titleNorm) {
-  return String(titleNorm || '')
-    .replace(/\bv?\d+(\.\d+)*\b/g, ' ')
-    .replace(/\b(build|dlc|dlcs|multi\d*|repack|deluxe|complete|edition|enhanced|update|hotfix|release|goty|definitive|collection|remastered)\b/g, ' ')
-    .replace(/\s{2,}/g, ' ').trim();
+  const base = String(titleNorm || '')
+    .replace(/\bfree\s*download\b/g, ' ')
+    .replace(/\b(build|dlc|dlcs|multi\d*|repack|deluxe|complete|edition|enhanced|update|hotfix|release|goty|definitive|collection|remastered|bonus|ost|co op|coop)\b/g, ' ')
+    .replace(/\ba\b/g, ' '); // mojibake "â€"" vira "a" solto — nunca é parte real do título
+  // Corta no primeiro token de versão: "v1", "v 1 4 5", "1.4.5", sequência de
+  // números "1 4 5 3"/"5 00b" (o normalize já tirou os pontos) ou ano (19xx/20xx).
+  // Números soltos curtos ficam (senão "Fallout 3" e "Fallout 4" virariam o mesmo jogo).
+  const m = /(?:^|\s)(v\s*\d|\d+\s*\.\s*\d|\d+(?:\s+\d+\w*)+|(?:19|20)\d{2}|\d{5,})\b/.exec(base);
+  return (m ? base.slice(0, m.index) : base).replace(/\s{2,}/g, ' ').trim();
 }
 
 /** Match tolerante: todos os tokens da busca presentes no título (qualquer ordem) OU substring contígua. */
