@@ -200,6 +200,19 @@ async function executeCommand(payload, ack) {
         const magnet = payload.magnetLink || payload.magnet || payload.uri;
         const link = payload.link || payload.directUrl;
         const result = downloads.add({ magnet, link, gameName: payload.gameName });
+        // Guarda os metadados junto da pasta do jogo (capa/descrição vindas do app)
+        if (result.ok && (payload.coverUrl || payload.description)) {
+          try {
+            const metaDir = result.download?.savePath || downloads._gameDir(payload.gameName);
+            fs.writeFileSync(path.join(metaDir, 'meta.json'), JSON.stringify({
+              title: payload.gameName,
+              coverUrl: payload.coverUrl || null,
+              description: payload.description || null,
+              source: payload.source || null,
+              savedAt: new Date().toISOString(),
+            }, null, 2));
+          } catch {}
+        }
         return ack(result.ok
           ? { ok: true, download: result.download, already: !!result.already }
           : { ok: false, error: result.error });
