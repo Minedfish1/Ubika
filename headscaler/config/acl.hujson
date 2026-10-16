@@ -1,0 +1,11 @@
+// ACL da malha Ubika — permissiva dentro da tailnet (PC e celular do mesmo usuário
+// precisam alcançar um ao outro em qualquer porta: Sunshine usa TCP 47984/47989/48010
+// e UDP 47998-48000).
+{
+	"acls": [
+		{"action": "accept", "src": ["*"], "dst": ["*:*"]}
+	],
+	"autoApprovers": {
+		"routes": {"0.0.0.0/0": [], "::/0": []}
+	}
+}

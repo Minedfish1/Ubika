@@ -1,14 +1,32 @@
-version: '3.8'
+# Headscale — plano de controle WireGuard para a malha Ubika (PC host <-> mobile).
+#
+# Deploy na VPS:
+#   docker compose up -d
+#   # criar usuário e chave de pré-auth para o PC:
+#   docker exec headscale-server headscale users create ian
+#   docker exec headscale-server headscale preauthkeys create --user ian --reusable --expiration 8760h
+#   # no PC:  tailscale login --login-server http://SEU_IP_VPS:8080 --authkey hskey-...
+#   # no Android: app Tailscale -> "usar servidor de coordenação custom" -> http://SEU_IP_VPS:8080
+#
+# IMPORTANTE: ajuste `server_url` e `ipv4` em ./config/config.yaml para o IP/domínio público da VPS.
 
 services:
   headscale:
-    image: headscale/headscale:latest
+    image: headscale/headscale:0.26.1   # versão fixada — nunca use :latest em produção
     container_name: headscale-server
+    restart: unless-stopped
     ports:
-      - "8080:8080"
-      - "9090:9090"
+      - "8080:8080"        # plano de controle (API + DERP embutido via websocket)
+      - "3478:3478/udp"    # STUN do DERP embutido (necessário p/ NAT/CGNAT móvel)
+    # Métricas ficam só em localhost — acesse via SSH tunnel se precisar
+    # (evita expor 9090 publicamente)
     volumes:
       - ./config:/etc/headscale
       - ./data:/var/lib/headscale
-    command: headscale serve
-    restart: unless-stopped
+    command: serve
+    healthcheck:
+      test: ["CMD", "headscale", "nodes", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
