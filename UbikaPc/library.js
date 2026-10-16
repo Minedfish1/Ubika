@@ -141,7 +141,12 @@ async function syncSources() {
     const name = path.basename(new URL(url).pathname);
     if (!name.toLowerCase().endsWith('.json')) { fail++; continue; }
     try {
-      const resp = await axios.get(url, { timeout: 60000, responseType: 'text', maxContentLength: 64 * 1024 * 1024 });
+      const resp = await axios.get(url, {
+        timeout: 60000,
+        responseType: 'text',
+        maxContentLength: 64 * 1024 * 1024,
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' },
+      });
       JSON.parse(resp.data); // valida antes de gravar
       const dest = path.join(DIR_LIBRARY, name);
       const tmp = dest + '.tmp';

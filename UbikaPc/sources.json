@@ -1,5 +1,12 @@
 {
   "sources": [
+    "https://raw.githubusercontent.com/Minedfish1/Ubika/main/UbikaPc/library/fitgirl.json",
+    "https://raw.githubusercontent.com/Minedfish1/Ubika/main/UbikaPc/library/dodi.json",
+    "https://raw.githubusercontent.com/Minedfish1/Ubika/main/UbikaPc/library/xatab.json",
+    "https://raw.githubusercontent.com/Minedfish1/Ubika/main/UbikaPc/library/empress.json",
+    "https://raw.githubusercontent.com/Minedfish1/Ubika/main/UbikaPc/library/onlinefix.json",
+    "https://raw.githubusercontent.com/Minedfish1/Ubika/main/UbikaPc/library/gog.json",
+    "https://raw.githubusercontent.com/Minedfish1/Ubika/main/UbikaPc/library/steamgg.json",
     "https://hydralinks.cloud/sources/fitgirl.json",
     "https://hydralinks.cloud/sources/dodi.json",
     "https://hydralinks.cloud/sources/xatab.json",
