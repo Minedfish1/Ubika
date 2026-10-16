@@ -22,7 +22,30 @@ let USER_ID = PAIRED ? envUserId : '';
 const DEVICE_ID = process.env.UBIKA_DEVICE_ID || `${os.hostname()}-${process.platform}`;
 const SERVER_URL = process.env.UBIKA_SERVER || 'http://localhost:3000';
 const SHARED_SECRET = process.env.UBIKA_SHARED_SECRET || '';
-const STREAM_HOST = process.env.UBIKA_STREAM_HOST || detectBestIp();
+const LAN_IP = detectBestIp();
+let PUBLIC_IP = process.env.UBIKA_STREAM_HOST || ''; // servidor também infere pelo handshake
+
+// Descobre o IP público (o celular conecta direto — a VPS só apresenta uma vez)
+function refreshPublicIp() {
+  try {
+    const https = require('https');
+    const req = https.get('https://api.ipify.org', { timeout: 8000 }, (res) => {
+      let d = '';
+      res.on('data', c => { d += c; });
+      res.on('end', () => {
+        const ip = d.trim();
+        if (/^\d{1,3}(\.\d{1,3}){3}$/.test(ip) && ip !== PUBLIC_IP) {
+          PUBLIC_IP = ip;
+          log(`[NET] IP público detectado: ${PUBLIC_IP}`);
+        }
+      });
+    });
+    req.on('error', () => {});
+    req.on('timeout', () => req.destroy());
+  } catch {}
+}
+refreshPublicIp();
+setInterval(refreshPublicIp, 10 * 60 * 1000); // revalida a cada 10 min (IP dinâmico)
 const SYNC_INTERVAL_MS = Number.parseInt(process.env.UBIKA_SYNC_INTERVAL_MS || `${6 * 60 * 60 * 1000}`, 10); // 6h
 const PAIR_CODE = PAIRED ? '' : String(crypto.randomInt(100000, 999999));
 
@@ -39,18 +62,80 @@ function saveUserIdToEnv(userId) {
   }
 }
 
-/** Prefere o IP do overlay (Tailscale 100.64.0.0/10); senão, primeiro IPv4 de LAN. */
+/** Primeiro IPv4 privado (RFC1918); senão qualquer não-interno. lanIp só interessa na mesma rede. */
 function detectBestIp() {
-  let lan = '';
+  let other = '';
   for (const list of Object.values(os.networkInterfaces())) {
     for (const item of list || []) {
       if (item.family !== 'IPv4' || item.internal) continue;
-      const parts = item.address.split('.').map(Number);
-      if (parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127) return item.address; // CGNAT/Tailscale
-      if (!lan) lan = item.address;
+      if (/^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(item.address)) return item.address;
+      if (!other) other = item.address;
     }
   }
-  return lan;
+  return other;
+}
+
+// ---------- Estado do cliente (o PC guarda as infos e continua sozinho) ----------
+const STATE_PATH = path.join(BASE_DIR, 'state.json');
+let state = { clientRes: null, lastClientAt: 0 };
+try { if (fs.existsSync(STATE_PATH)) state = { ...state, ...JSON.parse(fs.readFileSync(STATE_PATH, 'utf8')) }; } catch {}
+function saveState() {
+  try { fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2)); } catch {}
+}
+
+const ATTACH_PS1 = path.join(BASE_DIR, 'stream', 'display-attach.ps1');
+const DETACH_PS1 = path.join(BASE_DIR, 'stream', 'display-detach.ps1');
+
+/** Há stream ativo = conexão TCP estabelecida nas portas do Sunshine. */
+function isStreamActive() {
+  if (process.platform !== 'win32') return false;
+  try {
+    const out = require('child_process').execSync('netstat -an -p tcp', { encoding: 'utf8', timeout: 10000 });
+    return out.split(/\r?\n/).some(l =>
+      /ESTABLISHED/.test(l) && /:(47984|47989|47990|48010)\s/.test(l));
+  } catch { return false; }
+}
+
+function runPs(script, args) {
+  const { spawn } = require('child_process');
+  const cmdArgs = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', script, ...args];
+  try {
+    const child = spawn('powershell.exe', cmdArgs, { detached: true, stdio: 'ignore', windowsHide: true });
+    child.unref();
+    return { ok: true, pid: child.pid };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+}
+
+/** App mandou a resolução do celular → prepara o display virtual já. */
+function applyClientResolution(payload) {
+  const w = Number.parseInt(payload?.width, 10), h = Number.parseInt(payload?.height, 10);
+  const fps = Math.min(120, Math.max(24, Number.parseInt(payload?.fps, 10) || 60));
+  if (!w || !h || w < 320 || h < 240 || w > 8192 || h > 8192) return { ok: false, error: 'RES_INVALIDA' };
+  state.clientRes = { width: w, height: h, fps };
+  state.lastClientAt = Date.now();
+  saveState();
+  log(`[CLIENTE] resolução ${w}x${h}@${fps} — anexando display virtual`);
+  if (!sunshine.vddInstalled()) {
+    log('[CLIENTE] VDD ausente — resolução guardada; Sunshine aplica no stream');
+    return { ok: true, vddMissing: true, applied: state.clientRes };
+  }
+  const r = runPs(ATTACH_PS1, ['-Width', String(w), '-Height', String(h), '-Fps', String(fps)]);
+  return { ok: r.ok, applied: state.clientRes, error: r.error };
+}
+
+/** App fechou (ou pediu) → volta ao normal, a não ser que haja stream rolando. */
+function restoreDisplay(origem) {
+  state.lastClientAt = Date.now();
+  saveState();
+  if (isStreamActive()) {
+    log(`[CLIENTE] ${origem}: stream ativo — display segue até o fim do stream`);
+    return { ok: true, skipped: 'STREAM_ACTIVE' };
+  }
+  log(`[CLIENTE] ${origem}: restaurando display original`);
+  const r = runPs(DETACH_PS1, []);
+  return { ok: r.ok, error: r.error };
 }
 
 // ---------- Downloads ----------
@@ -89,7 +174,9 @@ async function executeCommand(payload, ack) {
         return ack({
           ok: true,
           deviceId: DEVICE_ID,
-          streamHost: STREAM_HOST,
+          lanIp: LAN_IP,
+          streamHost: PUBLIC_IP || LAN_IP,
+          clientRes: state.clientRes,
           downloadDir,
           downloads: downloads.list(),
           engine: downloads.engineName,
@@ -129,6 +216,12 @@ async function executeCommand(payload, ack) {
 
       case 'instalar_stream_setup':
         return ack(sunshine.installStreamSetup());
+
+      case 'preparar_stream':
+        return ack(applyClientResolution(payload));
+
+      case 'restaurar_display':
+        return ack(restoreDisplay('app pediu'));
 
       case 'launch_game': {
         const manifest = validateInstallPath(payload);
@@ -188,7 +281,8 @@ socket.on('connect', () => {
     socket.emit('registrar_pc', {
       userId: USER_ID,
       deviceId: DEVICE_ID,
-      streamHost: STREAM_HOST,
+      lanIp: LAN_IP,
+      streamHost: PUBLIC_IP || LAN_IP,
     }, (ack) => {
       log(`[REGISTRO] ${JSON.stringify(ack)}`);
     });
@@ -197,7 +291,8 @@ socket.on('connect', () => {
     socket.emit('registrar_pc', {
       pairCode: PAIR_CODE,
       deviceId: DEVICE_ID,
-      streamHost: STREAM_HOST,
+      lanIp: LAN_IP,
+      streamHost: PUBLIC_IP || LAN_IP,
     }, (ack) => {
       log(`[PAIR] ${JSON.stringify(ack)}`);
     });
@@ -215,9 +310,13 @@ socket.on('pareado', (data) => {
   socket.emit('registrar_pc', {
     userId,
     deviceId: DEVICE_ID,
-    streamHost: STREAM_HOST,
+    lanIp: LAN_IP,
+    streamHost: PUBLIC_IP || LAN_IP,
   }, (ack) => log(`[REGISTRO] ${JSON.stringify(ack)}`));
 });
+
+// VPS avisa que o último app desse usuário saiu → restaura display se não há stream
+socket.on('cliente_offline', () => restoreDisplay('app desconectou'));
 
 socket.on('connect_error', err => log(`[SOCKET] connect_error ${err.message}`));
 socket.on('disconnect', reason => log(`[SOCKET] desconectado reason=${reason}`));
@@ -266,4 +365,4 @@ if (!PAIRED) {
   try { fs.writeFileSync(path.join(BASE_DIR, 'PAREAR.txt'), `Código de pareamento Ubika: ${PAIR_CODE}\nVálido por 10 minutos. Digite no app mobile.\n`); } catch {}
 }
 
-log(`🟢 Ubika PC Daemon ativo user=${USER_ID || '(aguardando pareamento)'} device=${DEVICE_ID} streamHost=${STREAM_HOST || 'n/a'} engine=${downloads.engineName} dir=${downloadDir}`);
+log(`🟢 Ubika PC Daemon ativo user=${USER_ID || '(aguardando pareamento)'} device=${DEVICE_ID} lanIp=${LAN_IP || 'n/a'} engine=${downloads.engineName} dir=${downloadDir}`);

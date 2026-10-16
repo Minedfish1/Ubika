@@ -218,6 +218,12 @@ async function resolveUserId(req) {
   return legacy || DEFAULT_USER_ID;
 }
 
+/** IP público de quem conectou — é o endereço que o celular usa para o stream direto. */
+function clientIp(socket) {
+  const raw = String(socket.handshake.address || socket.request?.connection?.remoteAddress || '');
+  return raw.replace(/^::ffff:/, '').trim();
+}
+
 function registerPc(userId, socket, data) {
   removePcBySocket(socket.id);
   const old = pcSockets.get(userId);
@@ -225,13 +231,15 @@ function registerPc(userId, socket, data) {
     io.sockets.sockets.get(old.socketId)?.disconnect(true);
   }
   const deviceId = String(data?.deviceId || socket.id);
-  const streamHost = String(data?.streamHost || process.env.DEFAULT_STREAM_HOST || '').trim();
-  pcSockets.set(userId, { socketId: socket.id, deviceId, streamHost, lastSeen: Date.now() });
+  // streamHost = IP público do PC visto pela VPS; lanHost = IP de LAN p/ uso na mesma rede
+  const streamHost = clientIp(socket) || process.env.DEFAULT_STREAM_HOST || '';
+  const lanHost = String(data?.lanIp || '').trim();
+  pcSockets.set(userId, { socketId: socket.id, deviceId, streamHost, lanHost, lastSeen: Date.now() });
   socket.data.role = 'pc';
   socket.data.userId = userId;
   socket.join(`user:${userId}`);
-  log(`[PC] registrado user=${userId} socket=${socket.id} device=${deviceId} streamHost=${streamHost || 'n/a'}`);
-  io.to(`user:${userId}`).emit('pc_status', { userId, online: true, streamHost });
+  log(`[PC] registrado user=${userId} socket=${socket.id} device=${deviceId} publicIp=${streamHost} lan=${lanHost || 'n/a'}`);
+  io.to(`user:${userId}`).emit('pc_status', { userId, online: true, streamHost, lanHost });
   return { deviceId, streamHost };
 }
 
@@ -265,7 +273,7 @@ io.on('connection', (socket) => {
       pendingPcs.set(pairCode, {
         socketId: socket.id,
         deviceId: String(data?.deviceId || socket.id),
-        streamHost: String(data?.streamHost || '').trim(),
+        lanIp: String(data?.lanIp || '').trim(),
         expiresAt: Date.now() + PAIR_TTL_MS,
       });
       socket.data.role = 'pc_pending';
@@ -337,7 +345,16 @@ io.on('connection', (socket) => {
   });
 
   socket.on('disconnect', (reason) => {
+    const wasAndroid = androidSockets.get(socket.id);
     androidSockets.delete(socket.id);
+    // Último app do usuário saiu → avisa o PC para restaurar o display
+    if (wasAndroid && ![...androidSockets.values()].includes(wasAndroid)) {
+      const pc = getPc(wasAndroid);
+      if (pc) {
+        pc.socket.emit('cliente_offline', { userId: wasAndroid });
+        log(`[ANDROID] último app saiu user=${wasAndroid} → cliente_offline ao PC`);
+      }
+    }
     removePcBySocket(socket.id);
     log(`[SOCKET] disconnect id=${socket.id} reason=${reason}`);
   });
@@ -421,16 +438,16 @@ app.post('/api/pair', authHttp, async (req, res) => {
   if (!socket) { pendingPcs.delete(code); return res.status(410).json({ ok: false, error: 'PC_DESCONECTOU' }); }
 
   pendingPcs.delete(code);
-  registerPc(userId, socket, pending);
+  const { streamHost } = registerPc(userId, socket, pending);
   socket.emit('pareado', { userId, deviceId: pending.deviceId });
   log(`[PAIR] user=${userId} code=${code} device=${pending.deviceId}`);
-  res.json({ ok: true, userId, deviceId: pending.deviceId, streamHost: pending.streamHost });
+  res.json({ ok: true, userId, deviceId: pending.deviceId, streamHost });
 });
 
 app.get('/api/pc/status', authHttp, async (req, res) => {
   const userId = await resolveUserId(req);
   const pc = getPc(userId);
-  res.json({ ok: true, userId, online: Boolean(pc), streamHost: pc?.streamHost || '' });
+  res.json({ ok: true, userId, online: Boolean(pc), streamHost: pc?.streamHost || '', lanHost: pc?.lanHost || '' });
 });
 
 app.get('/api/debug/pcs', authHttp, (req, res) => {
@@ -502,6 +519,7 @@ app.post('/api/pc/command', authHttp, async (req, res) => {
     'iniciar_download', 'listar_downloads', 'pausar_download',
     'retomar_download', 'remover_download', 'sync_sources',
     'status_stream', 'instalar_stream_setup',
+    'preparar_stream', 'restaurar_display',
   ]);
 
   if (!allowed.has(action)) {
@@ -524,7 +542,8 @@ app.get('/api/stream', authHttp, async (req, res) => {
     ok: true,
     userId,
     host: pc.streamHost,
-    instructions: 'Use Moonlight para emparelhar com o Sunshine nesse host. A AWS não transporta o vídeo.',
+    lanHost: pc.lanHost || '',
+    instructions: 'Use Moonlight para emparelhar com o Sunshine nesse host. A VPS não transporta o vídeo — o stream é direto.',
   });
 });
 

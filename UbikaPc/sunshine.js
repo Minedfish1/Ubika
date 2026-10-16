@@ -98,6 +98,16 @@ function installStreamSetup() {
     report.steps.push('dd_resolution_option alterado disabled->auto');
   }
 
+  // 3. upnp = enabled — sem VPN: o Sunshine abre as portas do stream no roteador
+  const upnp = conf.match(/^upnp\s*=\s*(\S+)/m);
+  if (!upnp) {
+    conf += 'upnp = enabled\n';
+    report.steps.push('upnp=enabled adicionado (portas do stream abertas no roteador)');
+  } else if (upnp[1] !== 'enabled') {
+    conf = conf.replace(upnp[0], 'upnp = enabled');
+    report.steps.push(`upnp alterado ${upnp[1]}->enabled`);
+  }
+
   try {
     fs.writeFileSync(confPath, conf, 'utf8');
     report.steps.push('sunshine.conf salvo — reinicie o Sunshine para aplicar');
@@ -115,12 +125,15 @@ function streamStatus() {
   const confPath = findSunshineConf();
   let prepConfigured = false;
   let ddAuto = null;
+  let upnpOption = null;
   if (confPath) {
     try {
       const conf = fs.readFileSync(confPath, 'utf8');
       prepConfigured = /display-attach\.ps1/.test(conf);
       const dd = conf.match(/^dd_resolution_option\s*=\s*(\S+)/m);
       ddAuto = dd ? dd[1] : 'unset';
+      const up = conf.match(/^upnp\s*=\s*(\S+)/m);
+      upnpOption = up ? up[1] : 'unset';
     } catch {}
   }
   return {
@@ -130,6 +143,7 @@ function streamStatus() {
     vddInstalled: vddInstalled(),
     prepConfigured,
     ddResolutionOption: ddAuto,
+    upnp: upnpOption,
     attachScript: ATTACH_PS1,
     detachScript: DETACH_PS1,
   };

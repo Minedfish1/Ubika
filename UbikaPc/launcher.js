@@ -8,7 +8,7 @@ const { execSync, spawn, exec } = require('child_process');
  *
  * - Resolve a pasta de dados (UbikaPc ao lado do exe, ou a pasta do exe)
  * - Carrega o .env
- * - Verifica/inicia Sunshine, VDD e Tailscale
+ * - Verifica/inicia Sunshine e instala o VDD se faltar
  * - Aplica o setup de stream (display dinâmico) se o Sunshine existir
  * - Sobe o daemon (pareamento/downloads/comandos)
  */
@@ -52,70 +52,42 @@ function isProcessRunning(name) {
   } catch { return false; }
 }
 
-const TS_EXE = 'C:\\Program Files\\Tailscale\\tailscale.exe';
-const HEADSCALE_URL = (process.env.UBIKA_HEADSCALE_URL || 'http://18.223.108.137:8080').replace(/\/+$/, '');
-const HEADSCALE_KEY = process.env.UBIKA_HEADSCALE_KEY || '';
-const OFFICIAL_CONTROL = 'controlplane.tailscale.com';
-
-function tsRun(args) {
-  try {
-    return execSync(`"${TS_EXE}" ${args}`, { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
-  } catch { return ''; }
-}
-
-function tailscaleState() {
-  if (!fs.existsSync(TS_EXE)) return { installed: false, control: '', ip: '' };
-  let control = '';
-  try { control = JSON.parse(tsRun('debug prefs') || '{}').ControlURL || ''; } catch {}
-  const ip = tsRun('ip -4').split(/\r?\n/)[0] || '';
-  return { installed: true, control, ip };
-}
-
-/** Garante que o cliente está na headscale da VPS; troca se houver key. */
-function ensureHeadscale() {
-  const st = tailscaleState();
-  if (!st.installed) {
-    console.log('  …   Tailscale  não instalado — instale tailscale.com/download');
-    return '';
-  }
-  const onHeadscale = st.control.replace(/\/+$/, '') === HEADSCALE_URL;
-
-  if (onHeadscale && st.ip) return st.ip;
-
-  if (onHeadscale && !st.ip) {
-    console.log('  …   Headscale  conectado mas sem IP — rode tailscale up');
-    tsRun('up');
-    return tailscaleState().ip;
-  }
-
-  // Está em outro servidor (oficial ou headscale antiga): troca se tiver key
-  if (HEADSCALE_KEY) {
-    console.log(`  …   Trocando para headscale ${HEADSCALE_URL}…`);
-    tsRun('logout');
-    const out = tsRun(`login --login-server ${HEADSCALE_URL} --authkey ${HEADSCALE_KEY}`);
-    const ip = tailscaleState().ip;
-    if (ip) return ip;
-    console.log(`  !   Login falhou: ${out || 'sem resposta'}`);
-    return '';
-  }
-
-  console.log(`  …   Tailscale  está em ${st.control || 'desconectado'} — não é a headscale da VPS`);
-  console.log(`      → Rode:  "${TS_EXE}" login --login-server ${HEADSCALE_URL} --authkey <PREAUTHKEY>`);
-  console.log('      → ou defina UBIKA_HEADSCALE_KEY no .env para eu fazer isso sozinho');
-  return '';
-}
-
 function openUrl(url) {
   try { exec(`cmd /c start "" "${url}"`, { windowsHide: true }); } catch {}
+}
+
+function lanIp() {
+  let other = '';
+  for (const list of Object.values(os.networkInterfaces())) {
+    for (const item of list || []) {
+      if (item.family !== 'IPv4' || item.internal) continue;
+      if (/^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(item.address)) return item.address;
+      if (!other) other = item.address;
+    }
+  }
+  return other;
+}
+
+/** Pede UAC e instala o VDD vendored em UbikaPc\driver. Retorna true se o prompt foi lançado. */
+function installVddElevated() {
+  const ps1 = path.join(BASE_DIR, 'stream', 'install-vdd.ps1');
+  const driverDir = path.join(BASE_DIR, 'driver');
+  if (!fs.existsSync(ps1) || !fs.existsSync(path.join(driverDir, 'MttVDD.inf'))) return false;
+  try {
+    // ArgumentList como array de strings single-quoted — paths com espaço funcionam
+    const args = `'-NoProfile','-ExecutionPolicy','Bypass','-File','${ps1}','-Source','${driverDir}'`;
+    execSync(`powershell -NoProfile -Command "Start-Process powershell -Verb RunAs -Wait -ArgumentList ${args}"`, { stdio: 'ignore', timeout: 180000 });
+    return true;
+  } catch { return false; }
 }
 
 banner();
 log(`base=${BASE_DIR} sea=${isSea}`);
 
-// ---------- Overlay (headscale na VPS) ----------
-const tsIp = ensureHeadscale();
-console.log(`  ${ok(!!tsIp)} Headscale  ${tsIp || 'sem overlay — stream externo não funciona'}`);
-if (tsIp) process.env.UBIKA_STREAM_HOST = process.env.UBIKA_STREAM_HOST || tsIp;
+// ---------- Rede: conexão direta (VPS só apresenta o PC ao celular) ----------
+const lan = lanIp();
+console.log(`  ${ok(!!lan)} Rede      LAN ${lan || '?'} — IP público informado pela VPS`);
+console.log('         Stream direto PC↔celular; UPnP do Sunshine abre as portas no roteador');
 
 // ---------- Sunshine / VDD ----------
 const sunshine = require('./sunshine');
@@ -141,8 +113,14 @@ if (!st.sunshineInstalled) {
   openUrl('https://github.com/LizardByte/Sunshine/releases');
 }
 if (!st.vddInstalled) {
-  console.log('      → Baixe o VDD: https://github.com/VirtualDrivers/Virtual-Display-Driver/releases');
-  openUrl('https://github.com/VirtualDrivers/Virtual-Display-Driver/releases');
+  console.log('      → Tentando instalar o VDD embutido (aceite o prompt UAC)…');
+  if (installVddElevated()) {
+    const again = sunshine.streamStatus();
+    console.log(`  ${ok(again.vddInstalled)} VDD        ${again.vddInstalled ? 'instalado agora' : 'não instalou — veja %ProgramData%\\Ubika\\install-vdd.log'}`);
+  } else {
+    console.log('      → Instalação automática indisponível — rode como admin:');
+    console.log(`        powershell -File "${path.join(BASE_DIR, 'stream', 'install-vdd.ps1')}"`);
+  }
 }
 
 // Inicia o Sunshine se estiver instalado e não estiver rodando
