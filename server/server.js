@@ -322,6 +322,8 @@ db.serialize(() => {
   )`);
   // Renovação de plano: timestamp até quando o PRO vale (null no pro = vitalício/admin)
   db.run(`ALTER TABLE accounts ADD COLUMN planExpiresAt INTEGER`, () => {});
+  // Perfil do usuário: nome de exibição editável (avatar fica em disco, ver /avatars/)
+  db.run(`ALTER TABLE accounts ADD COLUMN displayName TEXT`, () => {});
   // Checkout web externo: o app abre /checkout/<sid> no navegador
   db.run(`CREATE TABLE IF NOT EXISTS checkouts (
     sid TEXT PRIMARY KEY,
@@ -397,6 +399,31 @@ function clientIp(socket) {
   return raw.replace(/^::ffff:/, '').trim();
 }
 
+/** A VPS tenta abrir TCP na porta do Sunshine (47984) — prova real se o PC é alcançável de fora do NAT. */
+function probeStreamPort(host, port = 47984) {
+  return new Promise((resolve) => {
+    const net = require('net');
+    const s = net.connect({ host, port, timeout: 4000 });
+    s.on('connect', () => { s.destroy(); resolve(true); });
+    s.on('timeout', () => { s.destroy(); resolve(false); });
+    s.on('error', () => { s.destroy(); resolve(false); });
+  });
+}
+
+function schedulePortProbe(userId, entry) {
+  if (!entry?.streamHost || !/^\d{1,3}(\.\d{1,3}){3}$/.test(entry.streamHost)) return;
+  if (entry._probing) return;
+  // Re-prova no máx. a cada 10min — registro/re-registro não deve martelar
+  if (entry.portsCheckedAt && Date.now() - entry.portsCheckedAt < 10 * 60 * 1000) return;
+  entry._probing = true;
+  probeStreamPort(entry.streamHost).then((open) => {
+    entry._probing = false;
+    entry.portsOpen = open;
+    entry.portsCheckedAt = Date.now();
+    log(`[PC] probe ${entry.streamHost}:47984 -> ${open ? 'ABERTA (acesso externo ok)' : 'fechada (CGNAT/UPnP falhou?)'}`);
+  });
+}
+
 function registerPc(userId, socket, data) {
   const old = pcSockets.get(userId);
   // Re-anúncio do MESMO socket (daemon re-registra a cada 30s): só atualiza
@@ -404,7 +431,9 @@ function registerPc(userId, socket, data) {
   if (old && old.socketId === socket.id) {
     old.streamHost = clientIp(socket) || old.streamHost;
     old.lanHost = String(data?.lanIp || '').trim() || old.lanHost;
+    old.streamHostV6 = String(data?.ipv6 || '').trim() || old.streamHostV6;
     old.lastSeen = Date.now();
+    schedulePortProbe(userId, old);
     return { deviceId: old.deviceId, streamHost: old.streamHost };
   }
   removePcBySocket(socket.id);
@@ -415,12 +444,14 @@ function registerPc(userId, socket, data) {
   // streamHost = IP público do PC visto pela VPS; lanHost = IP de LAN p/ uso na mesma rede
   const streamHost = clientIp(socket) || process.env.DEFAULT_STREAM_HOST || '';
   const lanHost = String(data?.lanIp || '').trim();
-  pcSockets.set(userId, { socketId: socket.id, deviceId, streamHost, lanHost, lastSeen: Date.now() });
+  const streamHostV6 = String(data?.ipv6 || '').trim(); // IPv6 público — bypass de CGNAT
+  pcSockets.set(userId, { socketId: socket.id, deviceId, streamHost, streamHostV6, lanHost, lastSeen: Date.now() });
   socket.data.role = 'pc';
   socket.data.userId = userId;
   socket.join(`user:${userId}`);
-  log(`[PC] registrado user=${userId} socket=${socket.id} device=${deviceId} publicIp=${streamHost} lan=${lanHost || 'n/a'}`);
+  log(`[PC] registrado user=${userId} socket=${socket.id} device=${deviceId} publicIp=${streamHost} v6=${streamHostV6 || 'n/a'} lan=${lanHost || 'n/a'}`);
   io.to(`user:${userId}`).emit('pc_status', { userId, online: true, streamHost, lanHost });
+  schedulePortProbe(userId, pcSockets.get(userId));
   return { deviceId, streamHost };
 }
 
@@ -614,9 +645,42 @@ app.get('/api/auth/me', authHttp, async (req, res) => {
   const token = String(req.header('x-ubika-session') || req.query.session || '');
   const s = token ? await dbGet('SELECT userId FROM sessions WHERE token = ?', token).catch(() => null) : null;
   if (!s) return res.status(401).json({ ok: false, error: 'SESSAO_INVALIDA' });
-  const acc = await dbGet('SELECT userId, email, plan, trialEndsAt, planExpiresAt FROM accounts WHERE userId = ?', s.userId).catch(() => null);
-  res.json({ ok: true, userId: s.userId, email: acc?.email, plan: acc?.plan, trialEndsAt: acc?.trialEndsAt,
+  const acc = await dbGet('SELECT userId, email, displayName, plan, trialEndsAt, planExpiresAt FROM accounts WHERE userId = ?', s.userId).catch(() => null);
+  res.json({ ok: true, userId: s.userId, email: acc?.email, name: acc?.displayName || '',
+    avatarUrl: `${PUBLIC_URL}/avatars/${s.userId}.jpg`,
+    plan: acc?.plan, trialEndsAt: acc?.trialEndsAt,
     planExpiresAt: acc?.planExpiresAt ?? null, effectivePlan: effectivePlan(acc) });
+});
+
+/** Atualiza nome de exibição (e avatar via base64) — as configs do app chamam aqui. */
+app.post('/api/me', authHttp, async (req, res) => {
+  const userId = await resolveUserId(req);
+  if (!userId) return res.status(401).json({ ok: false, error: 'UNAUTHORIZED' });
+  const name = String(req.body?.name ?? '').trim().slice(0, 40);
+  try {
+    if (name) await dbRun('UPDATE accounts SET displayName = ? WHERE userId = ?', name, userId);
+
+    const b64 = String(req.body?.avatarBase64 || '');
+    if (b64) {
+      const buf = Buffer.from(b64.replace(/^data:image\/\w+;base64,/, ''), 'base64');
+      if (buf.length > 4 * 1024 * 1024) return res.status(413).json({ ok: false, error: 'AVATAR_GRANDE' });
+      fs.mkdirSync(AVATARS_DIR, { recursive: true });
+      fs.writeFileSync(path.join(AVATARS_DIR, `${userId}.jpg`), buf);
+    }
+    res.json({ ok: true, name });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+const AVATARS_DIR = path.join(__dirname, 'avatars');
+try { fs.mkdirSync(AVATARS_DIR, { recursive: true }); } catch {}
+
+app.get('/avatars/:file', (req, res) => {
+  const fp = path.join(AVATARS_DIR, path.basename(String(req.params.file || '')));
+  res.setHeader('Cache-Control', 'public, max-age=300');
+  if (fs.existsSync(fp)) return res.sendFile(fp);
+  res.status(404).end();
 });
 
 /** Plano efetivo: pro se pago e dentro da validade (null = vitalício); trial se dentro do prazo; senão expirado. */
@@ -652,7 +716,16 @@ app.post('/api/pair', authHttp, rateLimit(15), async (req, res) => {
 app.get('/api/pc/status', authHttp, async (req, res) => {
   const userId = await resolveUserId(req);
   const pc = getPc(userId);
-  res.json({ ok: true, userId, online: Boolean(pc), streamHost: pc?.streamHost || '', lanHost: pc?.lanHost || '' });
+  if (pc) schedulePortProbe(userId, pc); // re-prova se o cache passou de 10min
+  res.json({
+    ok: true, userId,
+    online: Boolean(pc),
+    streamHost: pc?.streamHost || '',
+    streamHostV6: pc?.streamHostV6 || '',
+    lanHost: pc?.lanHost || '',
+    // null = ainda não medido; true/false = portas do Sunshine alcançáveis de fora
+    portsOpen: pc?.portsOpen ?? null,
+  });
 });
 
 app.get('/api/debug/pcs', authHttp, async (req, res) => {
@@ -773,7 +846,9 @@ app.get('/api/stream', authHttp, async (req, res) => {
     ok: true,
     userId,
     host: pc.streamHost,
+    hostV6: pc.streamHostV6 || '',
     lanHost: pc.lanHost || '',
+    portsOpen: pc.portsOpen ?? null,
     instructions: 'Use Moonlight para emparelhar com o Sunshine nesse host. A VPS não transporta o vídeo — o stream é direto.',
   });
 });

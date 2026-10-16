@@ -46,6 +46,21 @@ function refreshPublicIp() {
 }
 refreshPublicIp();
 setInterval(refreshPublicIp, 10 * 60 * 1000); // revalida a cada 10 min (IP dinâmico)
+
+// IPv6 público — bypass de CGNAT: celular na rua conecta direto sem depender
+// de UPnP/port-forward no roteador. 2000::/3 = unicast global (pula fe80:: e ULA).
+function detectPublicIpv6() {
+  for (const list of Object.values(os.networkInterfaces())) {
+    for (const item of list || []) {
+      const f = item.family;
+      if ((f === 'IPv6' || f === 6) && !item.internal && /^[23]/.test(item.address)) {
+        return item.address.replace(/%.+$/, ''); // tira zone id do Windows (%12)
+      }
+    }
+  }
+  return '';
+}
+const PUBLIC_V6 = detectPublicIpv6();
 const SYNC_INTERVAL_MS = Number.parseInt(process.env.UBIKA_SYNC_INTERVAL_MS || `${6 * 60 * 60 * 1000}`, 10); // 6h
 // Código de pareamento SEMPRE ativo: rotaciona antes do TTL do servidor (10min)
 // e é re-registrado a cada 30s — continua válido após restart da VPS e serve
@@ -251,6 +266,11 @@ async function executeCommand(payload, ack) {
         const manifest = validateInstallPath(payload);
         if (!manifest?.executable) return ack({ ok: false, error: 'INSTALL_MANIFEST_NOT_FOUND' });
 
+        // Abriu jogo → ajusta o display pra resolução do celular (se já anunciada
+        // ou enviada junto no payload). Sunshine repete no stream-start via prep_cmd.
+        const resToApply = (payload?.width && payload?.height) ? payload : state.clientRes;
+        if (resToApply?.width) applyClientResolution(resToApply);
+
         // Somente executáveis explicitamente registrados no manifesto local do usuário.
         const cwd = manifest.workingDirectory || path.dirname(manifest.executable);
         const { spawn } = require('child_process');
@@ -307,6 +327,7 @@ function announcePc() {
     deviceId: DEVICE_ID,
     lanIp: LAN_IP,
     streamHost: PUBLIC_IP || LAN_IP,
+    ipv6: PUBLIC_V6,
   }, (ack) => {
     log(`[REGISTRO] ${JSON.stringify(ack)}`);
   });
@@ -448,7 +469,7 @@ async function speedTest() {
   }
 }
 
-log(`🟢 Ubika PC Daemon ativo user=${USER_ID || '(aguardando pareamento)'} device=${DEVICE_ID} lanIp=${LAN_IP || 'n/a'} engine=${downloads.engineName} dir=${downloadDir}`);
+log(`🟢 Ubika PC Daemon ativo user=${USER_ID || '(aguardando pareamento)'} device=${DEVICE_ID} lanIp=${LAN_IP || 'n/a'} ipv6=${PUBLIC_V6 || 'n/a'} engine=${downloads.engineName} dir=${downloadDir}`);
 
 // ---------- GUI local: código de pareamento + status ----------
 try {
