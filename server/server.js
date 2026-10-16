@@ -111,15 +111,37 @@ function cleanTitle(title) {
   return t.replace(/\s{2,}/g, ' ').trim() || String(title || '');
 }
 
+/** Chave estável do jogo pra cache: título limpo, sem edição (GOTY/Deluxe...). */
+function metaKey(title) {
+  return cleanTitle(title).toLowerCase()
+    .replace(/\b(goty|complete|definitive|ultimate|deluxe|collectors?|remastered|enhanced|edition|version)\b/g, ' ')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s{2,}/g, ' ').trim();
+}
+
 async function rawgEnrich(game) {
   if (!RAWG_API_KEY || !game?.title) return game;
   // FALLBACK_COVER não conta como capa real — antes ela vencia a imagem do RAWG
   const hasCover = Boolean(game.coverUrl) && game.coverUrl !== FALLBACK_COVER;
   const hasDesc = Boolean(game.description) && game.description !== 'Sem descrição disponível.';
-  if (hasCover && hasDesc) return game;
+  const hasReq = Boolean(game.requirements);
+  if (hasCover && hasDesc && hasReq) return game;
 
   const searchTitle = cleanTitle(game.title);
   const key = searchTitle.toLowerCase();
+
+  // 1º) banco local — já enriquecido uma vez = zero chamadas de rede
+  const meta = await dbGet('SELECT * FROM game_meta WHERE key = ?', metaKey(game.title)).catch(() => null);
+  if (meta) {
+    return {
+      ...game,
+      coverUrl: hasCover ? game.coverUrl : (meta.coverUrl || FALLBACK_COVER),
+      description: hasDesc ? game.description : (meta.description || 'Sem descrição disponível.'),
+      requirements: hasReq ? game.requirements : (meta.requirements || null),
+    };
+  }
+
+  // 2º) miss → rede (RAWG + Steam) e grava pra sempre
   if (rawgCache.size > 5000) rawgCache.clear(); // evita crescer sem limite
   if (!rawgCache.has(key)) {
     rawgCache.set(key, axios.get('https://api.rawg.io/api/games', {
@@ -152,12 +174,21 @@ async function rawgEnrich(game) {
   let reqText = [pcReq.minimum, pcReq.recommended].filter(Boolean).join('\n\n');
   // RAWG quase nunca tem requisitos — Steam appdetails tem (grátis, sem key)
   if (!game.requirements && !reqText) reqText = await steamRequirements(searchTitle);
-  return {
-    ...game,
-    coverUrl: hasCover ? game.coverUrl : (r.background_image || FALLBACK_COVER),
-    description: hasDesc ? game.description : (r.description_raw || 'Sem descrição disponível.'),
-    requirements: game.requirements || reqText || null,
-  };
+
+  const coverUrl = hasCover ? game.coverUrl : (r.background_image || FALLBACK_COVER);
+  const description = hasDesc ? game.description : (r.description_raw || 'Sem descrição disponível.');
+  const requirements = game.requirements || reqText || null;
+
+  // Persiste no SQLite — próximas buscas desse jogo saem do DB, sem rede
+  if (coverUrl !== FALLBACK_COVER || description !== 'Sem descrição disponível.' || requirements) {
+    dbRun('INSERT OR REPLACE INTO game_meta (key,coverUrl,description,requirements,updatedAt) VALUES (?,?,?,?,?)',
+      metaKey(game.title), coverUrl !== FALLBACK_COVER ? coverUrl : null,
+      description !== 'Sem descrição disponível.' ? description : null,
+      requirements, Date.now()
+    ).catch(err => log(`[META] gravação falhou: ${err.message}`));
+  }
+
+  return { ...game, coverUrl, description, requirements };
 }
 
 const stripHtml = s => String(s || '').replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/\s{2,}/g, ' ').trim();
@@ -286,6 +317,14 @@ db.serialize(() => {
     status TEXT DEFAULT 'pending',
     createdAt INTEGER NOT NULL,
     paidAt INTEGER
+  )`);
+  // Metadados de jogos persistidos: busca na rede UMA vez por jogo, depois serve do DB
+  db.run(`CREATE TABLE IF NOT EXISTS game_meta (
+    key TEXT PRIMARY KEY,
+    coverUrl TEXT,
+    description TEXT,
+    requirements TEXT,
+    updatedAt INTEGER
   )`);
 });
 
