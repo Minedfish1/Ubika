@@ -20,11 +20,20 @@ const PAGE = `<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
   .row:last-child{border:0}
   .ok{color:#66BB6A}.bad{color:#EF5350}.mut{color:#8a7fa8}
   .dl{font-size:12px;color:#8a7fa8;margin-top:10px;max-height:90px;overflow:auto}
+  .diag{width:340px;margin-top:12px;background:#140822;border:1px solid #2a1750;border-radius:14px;padding:14px 18px}
+  .diag h2{color:#B39DDB;font-size:12px;letter-spacing:3px;margin:0 0 10px}
+  button{background:#673AB7;color:#fff;border:0;border-radius:10px;padding:10px 16px;font-size:13px;font-weight:700;cursor:pointer;width:100%}
+  button:disabled{opacity:.5}
+  #speed{font-size:13px;color:#D1C4E9;margin-top:10px;text-align:center;min-height:18px}
 </style></head><body>
 <h1>UBIKA PC</h1>
 <div class="sub" id="dev">—</div>
 <div id="main"></div>
 <div class="rows" id="rows"></div>
+<div class="diag"><h2>DIAGNÓSTICO</h2>
+  <button id="spd" onclick="speedTest()">TESTAR VELOCIDADE</button>
+  <div id="speed"></div>
+</div>
 <div class="dl" id="dl"></div>
 <script>
 async function tick(){
@@ -45,14 +54,32 @@ async function tick(){
     dl.innerHTML=(s.downloads||[]).map(d=>d.gameName+': '+(d.progress||0)+'%'+(d.state==='done'?' ✓':'')).join('<br>');
   }catch(e){}
 }
+async function speedTest(){
+  const b=document.getElementById('spd'), o=document.getElementById('speed');
+  b.disabled=true; o.textContent='Testando… (baixa ~25 MB)';
+  try{
+    const r=await (await fetch('/speedtest',{method:'POST'})).json();
+    o.innerHTML = r.ok
+      ? '⬇ <b>'+r.mbps+' Mbps</b>  ·  ping '+r.pingMs+'ms'
+      : 'Falhou: '+(r.detail||r.error||'erro');
+  }catch(e){ o.textContent='Falhou: '+e.message; }
+  b.disabled=false;
+}
 tick(); setInterval(tick,3000);
 </script></body></html>`;
 
-function startGui(port, getState) {
+function startGui(port, getState, onSpeedTest) {
   const srv = http.createServer((req, res) => {
     if (req.url === '/status.json') {
       res.setHeader('Content-Type', 'application/json');
       res.end(JSON.stringify(getState()));
+      return;
+    }
+    if (req.url === '/speedtest' && req.method === 'POST' && typeof onSpeedTest === 'function') {
+      res.setHeader('Content-Type', 'application/json');
+      onSpeedTest()
+        .then(r => res.end(JSON.stringify(r)))
+        .catch(e => res.end(JSON.stringify({ ok: false, error: 'SPEED_TEST_FAILED', detail: e.message })));
       return;
     }
     res.setHeader('Content-Type', 'text/html; charset=utf-8');

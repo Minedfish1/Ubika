@@ -82,6 +82,7 @@ function sanitizeGame(game, page, index) {
     title: String(game.title ?? 'Sem título'),
     coverUrl: game.coverUrl || FALLBACK_COVER,
     description: game.description || 'Sem descrição disponível.',
+    requirements: game.requirements || null,
     versions: Array.isArray(game.versions) ? game.versions.map(v => ({
       source: v.source || 'local',
       size: v.size || 'Desconhecido',
@@ -105,6 +106,8 @@ function cleanTitle(title) {
   t = t.replace(/\bv?\d+\.\d+(\.\d+)*\b/gi, ' ');
   t = t.replace(/\bbuild\s*\d+\b/gi, ' ');
   t = t.replace(/[*©®™]/g, ' ');
+  t = t.replace(/\bv\s*\d[\d.\s]*/gi, ' ');           // "v 5 00с", "v1.2.3" soltos
+  t = t.replace(/[^\x20-\x7E]/g, ' ');               // cirílico/unicode dos repacks
   return t.replace(/\s{2,}/g, ' ').trim() || String(title || '');
 }
 
@@ -128,13 +131,73 @@ async function rawgEnrich(game) {
     }));
   }
 
-  const r = await rawgCache.get(key);
+  let r = await rawgCache.get(key);
   if (!r) return game;
+
+  // O endpoint de busca não traz descrição/requisitos — busca o detalhe (cacheado)
+  const needDetail = !hasDesc || !game.requirements;
+  if (needDetail && r.id) {
+    const dkey = `detail:${r.id}`;
+    if (!rawgCache.has(dkey)) {
+      rawgCache.set(dkey, axios.get(`https://api.rawg.io/api/games/${r.id}`, {
+        params: { key: RAWG_API_KEY },
+        timeout: 5000,
+      }).then(x => x.data || null).catch(() => null));
+    }
+    const det = await rawgCache.get(dkey);
+    if (det) r = { ...r, ...det };
+  }
+
+  const pcReq = (r.platforms || []).find(p => p?.platform?.slug === 'pc')?.requirements || {};
+  let reqText = [pcReq.minimum, pcReq.recommended].filter(Boolean).join('\n\n');
+  // RAWG quase nunca tem requisitos — Steam appdetails tem (grátis, sem key)
+  if (!game.requirements && !reqText) reqText = await steamRequirements(searchTitle);
   return {
     ...game,
     coverUrl: hasCover ? game.coverUrl : (r.background_image || FALLBACK_COVER),
     description: hasDesc ? game.description : (r.description_raw || 'Sem descrição disponível.'),
+    requirements: game.requirements || reqText || null,
   };
+}
+
+const stripHtml = s => String(s || '').replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/\s{2,}/g, ' ').trim();
+
+/** Busca requisitos de PC na Steam: storesearch -> appdetails. Cacheado por título. */
+async function steamRequirements(title) {
+  if (!title) return null;
+  const key = `steam:${title.toLowerCase()}`;
+  if (!rawgCache.has(key)) {
+    rawgCache.set(key, (async () => {
+      try {
+        let s = await axios.get('https://store.steampowered.com/api/storesearch/', {
+          params: { term: title, cc: 'us', l: 'english' }, timeout: 6000,
+        });
+        let appid = s.data?.items?.[0]?.id;
+        if (!appid) {
+          // retry com título curto (antes do ":", sem restos de versão)
+          const short = title.split(':')[0].trim();
+          if (short !== title) {
+            s = await axios.get('https://store.steampowered.com/api/storesearch/', {
+              params: { term: short, cc: 'us', l: 'english' }, timeout: 6000,
+            });
+            appid = s.data?.items?.[0]?.id;
+          }
+        }
+        if (!appid) return null;
+        const d = await axios.get('https://store.steampowered.com/api/appdetails', {
+          params: { appids: appid }, timeout: 6000,
+        });
+        const req = d.data?.[appid]?.data?.pc_requirements;
+        if (!req || Array.isArray(req)) return null;
+        const parts = [
+          req.minimum ? `Mínimos: ${stripHtml(req.minimum)}` : '',
+          req.recommended ? `Recomendados: ${stripHtml(req.recommended)}` : '',
+        ].filter(Boolean);
+        return parts.join('\n\n') || null;
+      } catch { return null; }
+    })());
+  }
+  return rawgCache.get(key);
 }
 
 function requestPc(userId, event, payload, timeoutMs = PC_TIMEOUT_MS) {
@@ -615,7 +678,7 @@ app.post('/api/pc/command', authHttp, async (req, res) => {
     'iniciar_download', 'listar_downloads', 'pausar_download',
     'retomar_download', 'remover_download', 'sync_sources',
     'status_stream', 'instalar_stream_setup',
-    'preparar_stream', 'restaurar_display',
+    'preparar_stream', 'restaurar_display', 'speed_test',
   ]);
 
   if (!allowed.has(action)) {

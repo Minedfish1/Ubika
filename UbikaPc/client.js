@@ -229,6 +229,11 @@ async function executeCommand(payload, ack) {
       case 'restaurar_display':
         return ack(restoreDisplay('app pediu'));
 
+      case 'speed_test': {
+        const r = await speedTest();
+        return ack(r);
+      }
+
       case 'launch_game': {
         const manifest = validateInstallPath(payload);
         if (!manifest?.executable) return ack({ ok: false, error: 'INSTALL_MANIFEST_NOT_FOUND' });
@@ -399,6 +404,37 @@ function publishPairCode() {
 }
 publishPairCode();
 
+// ---------- Teste de velocidade (diagnóstico) ----------
+async function speedTest() {
+  const axios = require('axios');
+  try {
+    const t0 = Date.now();
+    await axios.get('https://speed.cloudflare.com/__down?bytes=1000', { timeout: 10000, responseType: 'arraybuffer' });
+    const pingMs = Date.now() - t0;
+
+    const wanted = 25_000_000;
+    const t1 = Date.now();
+    let received = 0;
+    const resp = await axios.get(`https://speed.cloudflare.com/__down?bytes=${wanted}`, {
+      timeout: 60000,
+      responseType: 'stream',
+    });
+    await new Promise((resolve, reject) => {
+      resp.data.on('data', c => { received += c.length; });
+      resp.data.on('end', resolve);
+      resp.data.on('error', reject);
+      resp.data.resume();
+    });
+    const secs = (Date.now() - t1) / 1000;
+    const mbps = secs > 0 ? (received * 8) / 1e6 / secs : 0;
+    const r = { ok: true, action: 'speed_test', pingMs, mbps: +mbps.toFixed(1), bytes: received, secs: +secs.toFixed(1) };
+    log(`[SPEED] ${r.mbps} Mbps / ping ${pingMs}ms`);
+    return r;
+  } catch (err) {
+    return { ok: false, error: 'SPEED_TEST_FAILED', detail: err.message };
+  }
+}
+
 log(`🟢 Ubika PC Daemon ativo user=${USER_ID || '(aguardando pareamento)'} device=${DEVICE_ID} lanIp=${LAN_IP || 'n/a'} engine=${downloads.engineName} dir=${downloadDir}`);
 
 // ---------- GUI local: código de pareamento + status ----------
@@ -422,7 +458,7 @@ try {
       downloads: downloads.list().slice(-5),
       uptime: Math.floor(process.uptime()),
     };
-  });
+  }, speedTest);
 } catch (err) {
   log(`[GUI] não subiu: ${err.message}`);
 }

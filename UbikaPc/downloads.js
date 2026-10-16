@@ -107,18 +107,28 @@ class DownloadManager {
     this._emitUpdate(entry);
   }
 
+  /** Cada jogo baixa na própria pasta: C:\UbikaGames\<Nome do Jogo>\... */
+  _gameDir(gameName) {
+    const clean = String(gameName || 'download')
+      .replace(/[\\/:*?"<>|]/g, ' ').replace(/\s{2,}/g, ' ').trim().slice(0, 80)
+      || 'download';
+    return path.join(this.savePath, clean);
+  }
+
   add({ magnet, link, gameName }) {
     magnet = String(magnet || '').trim();
     link = String(link || '').trim();
+    const targetDir = this._gameDir(gameName);
+    fs.mkdirSync(targetDir, { recursive: true });
 
     // Fonte sem magnet (steamgg & cia) → download HTTP direto para o disco
     if (!magnet.startsWith('magnet:') && /^https?:\/\//i.test(link)) {
-      return this._addHttp(link, String(gameName || 'download'));
+      return this._addHttp(link, String(gameName || 'download'), targetDir);
     }
     if (!magnet.startsWith('magnet:')) return { ok: false, error: 'INVALID_MAGNET' };
 
     // qBittorrent (libtorrent real) tem prioridade quando disponível
-    if (this.qb) return this._addQb(magnet, String(gameName || 'download'));
+    if (this.qb) return this._addQb(magnet, String(gameName || 'download'), targetDir);
 
     if (!this.client) return { ok: false, error: 'ENGINE_UNAVAILABLE' };
 
@@ -138,7 +148,7 @@ class DownloadManager {
       gameName: String(gameName || 'download'),
       state: 'fetching-metadata',
       torrent: null,
-      savePath: this.savePath,
+      savePath: targetDir,
       addedAt: new Date().toISOString(),
       finishedAt: null,
       error: null,
@@ -146,7 +156,7 @@ class DownloadManager {
 
     let torrent;
     try {
-      torrent = this.client.add(magnet, { path: this.savePath });
+      torrent = this.client.add(magnet, { path: targetDir });
     } catch (err) {
       return { ok: false, error: err.message };
     }
@@ -184,7 +194,7 @@ class DownloadManager {
 
   // ---------- qBittorrent ----------
 
-  _addQb(magnet, gameName) {
+  _addQb(magnet, gameName, targetDir = this.savePath) {
     const hash = extractInfoHash(magnet);
     const entry = {
       id: hash || `qb-${Date.now()}`,
@@ -193,7 +203,7 @@ class DownloadManager {
       state: 'fetching-metadata',
       torrent: null,
       kind: 'qb',
-      savePath: this.savePath,
+      savePath: targetDir,
       addedAt: new Date().toISOString(),
       finishedAt: null,
       error: null,
@@ -201,7 +211,7 @@ class DownloadManager {
     };
     this.downloads.set(entry.id, entry);
     this._qbNames.set(hash, gameName);
-    this.qb.addMagnet(magnet, this.savePath)
+    this.qb.addMagnet(magnet, targetDir)
       .then(() => { this._setState(entry, 'downloading'); this._pollQb(); })
       .catch(err => { this.downloads.delete(entry.id); this._setState(entry, 'error', err); });
     log(`[DL] qb adicionado: ${gameName} hash=${hash}`);
@@ -247,11 +257,11 @@ class DownloadManager {
 
   // ---------- Download HTTP direto (fontes sem magnet: steamgg, datanodes...) ----------
 
-  _addHttp(link, gameName) {
+  _addHttp(link, gameName, targetDir = this.savePath) {
     const id = `http-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const fname = decodeURIComponent(path.basename(new URL(link).pathname) || `${gameName}.bin`)
       .replace(/[\\/:*?"<>|]/g, '_');
-    const dest = path.join(this.savePath, fname);
+    const dest = path.join(targetDir, fname);
     const entry = {
       id, gameName, state: 'downloading', torrent: null, kind: 'http',
       savePath: dest, addedAt: new Date().toISOString(), finishedAt: null, error: null,
@@ -421,8 +431,8 @@ function extractInfoHash(magnet) {
 function defaultDownloadDir() {
   return process.env.UBIKA_DOWNLOAD_DIR
     || (process.platform === 'win32'
-      ? 'C:\\UbikaGames\\Downloads'
-      : path.join(os.homedir(), 'UbikaGames', 'Downloads'));
+      ? 'C:\\UbikaGames'
+      : path.join(os.homedir(), 'UbikaGames'));
 }
 
 module.exports = { DownloadManager, defaultDownloadDir };
