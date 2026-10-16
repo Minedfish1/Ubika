@@ -35,7 +35,7 @@ const db = new sqlite3.Database(process.env.SQLITE_PATH || './ubika_cloud.db');
 const pcSockets = new Map(); // userId -> { socketId, deviceId, streamHost, lastSeen }
 const androidSockets = new Map(); // socketId -> userId
 const rawgCache = new Map();
-let trendingCache = { games: [], ts: 0 };
+const trendingCache = {}; // chave: gênero ('_top' = geral) -> { games, ts }
 
 const log = (...args) => console.log(new Date().toISOString(), ...args);
 const makeRequestId = () => crypto.randomUUID();
@@ -739,9 +739,26 @@ app.get('/api/debug/pcs', authHttp, async (req, res) => {
   res.json({ ok: true, pcs: Object.fromEntries(pcSockets) });
 });
 
+/** Gênero pedido pelo app → filtro RAWG. Terror não é "genre" lá, é tag. */
+const TRENDING_GENRES = {
+  action:    { genres: 'action' },
+  adventure: { genres: 'adventure' },
+  rpg:       { genres: 'role-playing-games-rpg' },
+  shooter:   { genres: 'shooter' },
+  racing:    { genres: 'racing' },
+  sports:    { genres: 'sports' },
+  fighting:  { genres: 'fighting' },
+  strategy:  { genres: 'strategy' },
+  horror:    { tags: 'horror' },
+  indie:     { genres: 'indie' },
+};
+
 app.get('/api/trending', authHttp, async (req, res) => {
-  if (trendingCache.games.length && Date.now() - trendingCache.ts < TRENDING_TTL_MS) {
-    return res.json({ ok: true, games: trendingCache.games, source: 'cache' });
+  const genreKey = String(req.query.genre || '').toLowerCase();
+  const cacheKey = genreKey || '_top';
+  const cached = trendingCache[cacheKey];
+  if (cached?.games?.length && Date.now() - cached.ts < TRENDING_TTL_MS) {
+    return res.json({ ok: true, games: cached.games, source: 'cache' });
   }
 
   if (!RAWG_API_KEY) {
@@ -752,10 +769,10 @@ app.get('/api/trending', authHttp, async (req, res) => {
     const now = new Date();
     const past = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
     const fmt = d => d.toISOString().slice(0, 10);
-    const result = await axios.get('https://api.rawg.io/api/games', {
-      params: { key: RAWG_API_KEY, ordering: '-added', dates: `${fmt(past)},${fmt(now)}`, page_size: 10 },
-      timeout: 8000,
-    });
+    const params = { key: RAWG_API_KEY, ordering: '-added', dates: `${fmt(past)},${fmt(now)}`, page_size: 10 };
+    Object.assign(params, TRENDING_GENRES[genreKey] || {});
+
+    const result = await axios.get('https://api.rawg.io/api/games', { params, timeout: 8000 });
 
     const games = (result.data?.results || []).map((g) => sanitizeGame({
       id: g.id,
@@ -766,12 +783,12 @@ app.get('/api/trending', authHttp, async (req, res) => {
       installed: false,
     }, 1, 0));
 
-    trendingCache = { games, ts: Date.now() };
-    log(`[TRENDING] ${games.length} jogos RAWG`);
+    trendingCache[cacheKey] = { games, ts: Date.now() };
+    log(`[TRENDING] ${games.length} jogos RAWG${genreKey ? ` (${genreKey})` : ''}`);
     return res.json({ ok: true, games, source: 'rawg' });
   } catch (err) {
     log(`[TRENDING] erro ${err.message}`);
-    if (trendingCache.games.length) return res.json({ ok: true, games: trendingCache.games, source: 'stale-cache' });
+    if (cached?.games?.length) return res.json({ ok: true, games: cached.games, source: 'stale-cache' });
     return res.status(502).json({ ok: false, error: 'TRENDING_UNAVAILABLE', games: [] });
   }
 });
