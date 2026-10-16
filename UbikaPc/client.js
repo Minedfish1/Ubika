@@ -198,7 +198,8 @@ async function executeCommand(payload, ack) {
 
       case 'iniciar_download': {
         const magnet = payload.magnetLink || payload.magnet || payload.uri;
-        const result = downloads.add({ magnet, gameName: payload.gameName });
+        const link = payload.link || payload.directUrl;
+        const result = downloads.add({ magnet, link, gameName: payload.gameName });
         return ack(result.ok
           ? { ok: true, download: result.download, already: !!result.already }
           : { ok: false, error: result.error });

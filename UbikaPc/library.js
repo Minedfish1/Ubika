@@ -32,8 +32,29 @@ function extrairLista(data) {
   if (Array.isArray(data)) return data;
   for (const key of ['games', 'downloads', 'repacks', 'items']) {
     if (Array.isArray(data?.[key])) return data[key];
+    // Alguns dumps vêm como objeto { "Titulo": {uris:[...]} } em vez de array
+    if (data?.[key] && typeof data[key] === 'object') {
+      return Object.entries(data[key]).map(([k, v]) => ({ title: v?.title || k, ...v }));
+    }
   }
   return null;
+}
+
+/** Alguns catálogos trazem HTML-entities nas URIs (&#038; &amp; ...) — decodifica. */
+function decodeEntities(s) {
+  return String(s || '')
+    .replace(/&#0*38;|&amp;/g, '&')
+    .replace(/&#0*39;|&apos;/g, "'")
+    .replace(/&quot;/g, '"')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>');
+}
+
+/** Nome do jogo via dn= do magnet quando o item não traz title. */
+function titleFromMagnet(magnet) {
+  const m = /[?&]dn=([^&]*)/i.exec(String(magnet || ''));
+  if (!m) return '';
+  try { return decodeURIComponent(m[1].replace(/\+/g, ' ')); } catch { return m[1]; }
 }
 
 function loadLibrary() {
@@ -55,12 +76,15 @@ function loadLibrary() {
 
       let valid = 0;
       for (const item of list) {
-        const title = String(item?.title || item?.name || '').replace(/\./g, ' ').trim();
-        if (!title) continue;
-
-        // Hydra: "uris": ["magnet:...", "magnet:..."] — primeira URI é o magnet principal
-        const uris = Array.isArray(item.uris) ? item.uris : item.uri ? [item.uri] : [];
+        // Hydra: "uris": ["magnet:...", "magnet:..."] — steamgg e afins mandam links HTTP diretos
+        const uris = (Array.isArray(item.uris) ? item.uris : item.uri ? [item.uri] : []).map(decodeEntities);
         const magnet = uris.find(u => String(u).startsWith('magnet:')) || null;
+        const directLinks = uris.filter(u => /^https?:\/\//i.test(String(u)));
+
+        // Fallback: sem title explícito, extrai o nome do parâmetro dn= do magnet
+        let title = String(item?.title || item?.name || '').replace(/\./g, ' ').trim();
+        if (!title) title = titleFromMagnet(magnet).trim();
+        if (!title) continue;
 
         next.push({
           id: String(item.id || `${file}:${valid}`),
@@ -73,8 +97,9 @@ function loadLibrary() {
           description: item.description || null,
           installed: Boolean(item.installed),
           installId: item.installId || null,
-          downloadAvailable: Boolean(item.downloadAvailable ?? magnet),
+          downloadAvailable: Boolean(item.downloadAvailable ?? (magnet || directLinks.length)),
           magnet,
+          directLinks,
         });
         valid++;
       }
@@ -95,27 +120,60 @@ function scheduleReload() {
   reloadTimer = setTimeout(loadLibrary, 300);
 }
 
+/** Chave de agrupamento: título limpo de versão/DLCs — junta a mesma obra de várias fontes. */
+function groupKey(titleNorm) {
+  return String(titleNorm || '')
+    .replace(/\bv?\d+(\.\d+)*\b/g, ' ')
+    .replace(/\b(build|dlc|dlcs|multi\d*|repack|deluxe|complete|edition|enhanced|update|hotfix|release|goty|definitive|collection|remastered)\b/g, ' ')
+    .replace(/\s{2,}/g, ' ').trim();
+}
+
+/** Match tolerante: todos os tokens da busca presentes no título (qualquer ordem) OU substring contígua. */
+function matches(g, term) {
+  if (!term) return true;
+  if (g.titleNorm.includes(term)) return true;
+  const qt = term.split(' ').filter(Boolean);
+  if (qt.length < 2) return false;
+  const tt = g.titleNorm.split(' ');
+  return qt.every(q => tt.some(t => t.includes(q)));
+}
+
 function searchLibrary(search, page) {
   if (!biblioteca.length) loadLibrary();
   const term = normalizarTexto(search);
-  const filtered = term ? biblioteca.filter(g => g.titleNorm.includes(term)) : biblioteca;
+  const filtered = term ? biblioteca.filter(g => matches(g, term)) : biblioteca;
+
+  // Agrupa por obra: um jogo presente em várias fontes vira um card com várias versões
+  const groups = new Map();
+  for (const g of filtered) {
+    const key = groupKey(g.titleNorm) || g.titleNorm;
+    let grp = groups.get(key);
+    if (!grp) { grp = { rep: g, versions: [] }; groups.set(key, grp); }
+    grp.versions.push({
+      source: g.source,
+      size: g.size,
+      magnet: g.magnet,
+      links: g.directLinks,
+      installId: g.installId,
+      downloadAvailable: g.downloadAvailable,
+    });
+    // representante = entrada mais recente do grupo
+    if (String(g.date) > String(grp.rep.date)) grp.rep = g;
+  }
+  const ordered = [...groups.values()].sort((a, b) =>
+    String(b.rep.date).localeCompare(String(a.rep.date)) || a.rep.title.localeCompare(b.rep.title));
+
   const start = (page - 1) * PAGE_SIZE;
   const end = page * PAGE_SIZE;
-  const games = filtered.slice(start, end).map((g, i) => ({
+  const games = ordered.slice(start, end).map(({ rep: g, versions }, i) => ({
     id: g.id || `${page}-${i}`,
     title: g.title,
     coverUrl: g.coverUrl || FALLBACK_COVER,
     description: g.description || 'Sem descrição disponível.',
     installed: g.installed,
-    versions: [{
-      source: g.source,
-      size: g.size,
-      magnet: g.magnet,
-      installId: g.installId,
-      downloadAvailable: g.downloadAvailable,
-    }],
+    versions,
   }));
-  return { games, isLastPage: end >= filtered.length, total: filtered.length };
+  return { games, isLastPage: end >= ordered.length, total: ordered.length };
 }
 
 /**

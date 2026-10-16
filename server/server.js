@@ -49,8 +49,14 @@ function tokenOk(token) {
   return !UBIKA_SHARED_SECRET || token === UBIKA_SHARED_SECRET;
 }
 
-function authHttp(req, res, next) {
+/** Aceita o segredo compartilhado (daemon/legado) OU sessão válida (app novo). */
+async function authHttp(req, res, next) {
   if (tokenOk(req.header('x-ubika-token'))) return next();
+  const sess = String(req.header('x-ubika-session') || req.query.session || req.body?.session || '');
+  if (sess) {
+    const s = await dbGet('SELECT userId FROM sessions WHERE token = ?', sess).catch(() => null);
+    if (s) { req.ubikaUserId = s.userId; return next(); }
+  }
   return res.status(401).json({ ok: false, error: 'UNAUTHORIZED' });
 }
 
@@ -79,7 +85,8 @@ function sanitizeGame(game, page, index) {
     versions: Array.isArray(game.versions) ? game.versions.map(v => ({
       source: v.source || 'local',
       size: v.size || 'Desconhecido',
-      magnet: v.magnet || null,
+      magnet: v.magnet || '',
+      links: Array.isArray(v.links) ? v.links.filter(l => typeof l === 'string').slice(0, 8) : [],
       installId: v.installId || null,
       downloadAvailable: Boolean(v.downloadAvailable),
     })) : [],
@@ -110,6 +117,7 @@ async function rawgEnrich(game) {
 
   const searchTitle = cleanTitle(game.title);
   const key = searchTitle.toLowerCase();
+  if (rawgCache.size > 5000) rawgCache.clear(); // evita crescer sem limite
   if (!rawgCache.has(key)) {
     rawgCache.set(key, axios.get('https://api.rawg.io/api/games', {
       params: { key: RAWG_API_KEY, search: searchTitle, page_size: 1 },
@@ -204,6 +212,8 @@ db.serialize(() => {
     userId TEXT NOT NULL,
     createdAt INTEGER NOT NULL
   )`);
+  // Renovação de plano: timestamp até quando o PRO vale (null no pro = vitalício/admin)
+  db.run(`ALTER TABLE accounts ADD COLUMN planExpiresAt INTEGER`, () => {});
   // Checkout web externo: o app abre /checkout/<sid> no navegador
   db.run(`CREATE TABLE IF NOT EXISTS checkouts (
     sid TEXT PRIMARY KEY,
@@ -223,6 +233,20 @@ const PAIR_TTL_MS = 10 * 60 * 1000;
 const dbGet = (sql, ...args) => new Promise((res, rej) => db.get(sql, args, (e, r) => e ? rej(e) : res(r)));
 const dbRun = (sql, ...args) => new Promise((res, rej) => db.run(sql, args, function (e) { return e ? rej(e) : res(this); }));
 
+// Rate limit simples em memória: 15 req por 5min por IP nas rotas sensíveis
+const rateBuckets = new Map();
+function rateLimit(max = 15, windowMs = 5 * 60 * 1000) {
+  return (req, res, next) => {
+    const key = `${req.ip}|${req.path}`;
+    const now = Date.now();
+    const arr = (rateBuckets.get(key) || []).filter(t => now - t < windowMs);
+    if (arr.length >= max) return res.status(429).json({ ok: false, error: 'MUITAS_TENTATIVAS' });
+    arr.push(now); rateBuckets.set(key, arr);
+    next();
+  };
+}
+setInterval(() => { const now = Date.now(); for (const [k, a] of rateBuckets) { const f = a.filter(t => now - t < 600000); if (!f.length) rateBuckets.delete(k); else rateBuckets.set(k, f); } }, 60000).unref?.();
+
 function hashPassword(password, salt) {
   return crypto.scryptSync(String(password), salt, 64).toString('hex');
 }
@@ -233,15 +257,22 @@ async function createSession(userId) {
   return token;
 }
 
-/** userId do request: sessão (header/query) tem prioridade; senão userId legado; senão default. */
+/**
+ * userId do request: sessão válida manda; sem sessão só aceita userId legado se o
+ * chamador tem o segredo compartilhado (daemon/legado). Senão → null (401).
+ */
 async function resolveUserId(req) {
+  if (req.ubikaUserId) return req.ubikaUserId;
   const token = String(req.header('x-ubika-session') || req.query.session || req.body?.session || '');
   if (token) {
     const s = await dbGet('SELECT userId FROM sessions WHERE token = ?', token).catch(() => null);
-    if (s) return s.userId;
+    return s ? s.userId : null;
   }
-  const legacy = String(req.query.userId || req.body?.userId || '').trim();
-  return legacy || DEFAULT_USER_ID;
+  if (tokenOk(req.header('x-ubika-token'))) {
+    const legacy = String(req.query.userId || req.body?.userId || '').trim();
+    return legacy || DEFAULT_USER_ID;
+  }
+  return null;
 }
 
 /** IP público de quem conectou — é o endereço que o celular usa para o stream direto. */
@@ -270,28 +301,35 @@ function registerPc(userId, socket, data) {
 }
 
 // ------------------------- Socket.io -------------------------
+// Handshake: segredo compartilhado (daemon PC/legado) OU token de sessão (app).
+io.use(async (socket, next) => {
+  if (socketTokenOk(socket)) return next();
+  const sess = String(socket.handshake.auth?.session || socket.handshake.auth?.token || '');
+  if (!sess) return next(new Error('UNAUTHORIZED'));
+  const s = await dbGet('SELECT userId FROM sessions WHERE token = ?', sess).catch(() => null);
+  if (!s) return next(new Error('UNAUTHORIZED'));
+  socket.data.sessionUserId = s.userId;
+  next();
+});
+
 io.on('connection', (socket) => {
   log(`[SOCKET] connect id=${socket.id} ip=${socket.handshake.address}`);
 
-  if (!socketTokenOk(socket)) {
-    log(`[SOCKET] token inválido id=${socket.id}`);
-    socket.emit('server_error', { error: 'UNAUTHORIZED' });
-    socket.disconnect(true);
-    return;
-  }
-
-  // Mobiles/PCs que já trazem userId na query entram direto na sala do usuário.
-  // (o app Android nunca chama registrar_android explicitamente — só seta a query)
+  // Sessão autenticada manda no userId — cliente não pode se passar por outro.
+  const sessionUserId = socket.data.sessionUserId;
   const queryUserId = String(socket.handshake.query?.userId || '').trim();
-  if (queryUserId) {
-    socket.data.userId = queryUserId;
-    socket.data.role = socket.handshake.query.device === 'pc' ? 'pc' : 'android';
-    socket.join(`user:${queryUserId}`);
-    if (socket.data.role !== 'pc') androidSockets.set(socket.id, queryUserId);
+  const effectiveUserId = sessionUserId || (socketTokenOk(socket) ? queryUserId : '');
+  if (effectiveUserId) {
+    socket.data.userId = effectiveUserId;
+    socket.data.role = sessionUserId ? 'android' : (socket.handshake.query.device === 'pc' ? 'pc' : 'android');
+    socket.join(`user:${effectiveUserId}`);
+    if (socket.data.role !== 'pc') androidSockets.set(socket.id, effectiveUserId);
   }
 
   socket.on('registrar_pc', (data, ack) => {
-    const userId = String(data?.userId || '').trim();
+    // Sessão autenticada só registra PC na própria conta — o daemon (segredo
+    // compartilhado) segue podendo informar o userId pareado no .env.
+    const userId = String(socket.data.sessionUserId || data?.userId || '').trim();
     const pairCode = String(data?.pairCode || '').trim();
 
     // Código sempre ativo: o PC rotaciona (~9min) e re-registra — parear funciona
@@ -321,7 +359,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('registrar_android', (data, ack) => {
-    const userId = String(data?.userId || '').trim();
+    const userId = String(socket.data.userId || data?.userId || '').trim();
     if (!userId) return ack?.({ ok: false, error: 'USER_ID_REQUIRED' });
     androidSockets.set(socket.id, userId);
     socket.data.role = 'android';
@@ -355,7 +393,8 @@ io.on('connection', (socket) => {
   // App -> VPS -> PC : encaminha comando e devolve o ack do PC ao app
   socket.on('send_to_pc', (data, ack) => {
     const reply = typeof ack === 'function' ? ack : () => {};
-    const userId = String(data?.userId || socket.data.userId || '');
+    // userId do socket (autenticado) tem prioridade — impede comandar PC de outro usuário
+    const userId = String(socket.data.userId || data?.userId || '');
     const payload = data?.payload || {};
     if (!userId) return reply({ ok: false, error: 'MISSING_USER_ID' });
 
@@ -395,14 +434,16 @@ app.get('/api/health', (req, res) => {
   res.json({
     ok: true,
     uptimeSeconds: Math.round(process.uptime()),
-    pcsOnline: [...pcSockets.entries()].map(([userId, pc]) => ({ userId, ...pc })),
+    // Só quantidade — userIds/streamHosts não são dados públicos
+    pcsOnline: pcSockets.size,
+    pendingPair: pendingPcs.size,
     rawgConfigured: Boolean(RAWG_API_KEY),
     authEnabled: Boolean(UBIKA_SHARED_SECRET),
   });
 });
 
 // ------------------------- Auth -------------------------
-app.post('/api/auth/register', async (req, res) => {
+app.post('/api/auth/register', rateLimit(10), async (req, res) => {
   const email = String(req.body?.email || '').trim().toLowerCase();
   const password = String(req.body?.password || '');
   if (!/^\S+@\S+\.\S+$/.test(email)) return res.status(400).json({ ok: false, error: 'EMAIL_INVALIDO' });
@@ -429,7 +470,7 @@ app.post('/api/auth/register', async (req, res) => {
   }
 });
 
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', rateLimit(15), async (req, res) => {
   const email = String(req.body?.email || '').trim().toLowerCase();
   const password = String(req.body?.password || '');
   try {
@@ -449,14 +490,24 @@ app.get('/api/auth/me', authHttp, async (req, res) => {
   const token = String(req.header('x-ubika-session') || req.query.session || '');
   const s = token ? await dbGet('SELECT userId FROM sessions WHERE token = ?', token).catch(() => null) : null;
   if (!s) return res.status(401).json({ ok: false, error: 'SESSAO_INVALIDA' });
-  const acc = await dbGet('SELECT userId, email, plan, trialEndsAt FROM accounts WHERE userId = ?', s.userId).catch(() => null);
-  res.json({ ok: true, userId: s.userId, email: acc?.email, plan: acc?.plan, trialEndsAt: acc?.trialEndsAt });
+  const acc = await dbGet('SELECT userId, email, plan, trialEndsAt, planExpiresAt FROM accounts WHERE userId = ?', s.userId).catch(() => null);
+  res.json({ ok: true, userId: s.userId, email: acc?.email, plan: acc?.plan, trialEndsAt: acc?.trialEndsAt,
+    planExpiresAt: acc?.planExpiresAt ?? null, effectivePlan: effectivePlan(acc) });
 });
 
+/** Plano efetivo: pro se pago e dentro da validade (null = vitalício); trial se dentro do prazo; senão expirado. */
+function effectivePlan(acc) {
+  const now = Date.now();
+  if (acc?.plan === 'pro' && (acc.planExpiresAt == null || acc.planExpiresAt > now)) return 'pro';
+  if (acc?.trialEndsAt && acc.trialEndsAt > now) return 'trial';
+  if (acc?.plan === 'pro' && acc.planExpiresAt != null && acc.planExpiresAt <= now) return 'expired';
+  return acc?.plan === 'trial' && acc.trialEndsAt && acc.trialEndsAt <= now ? 'expired' : (acc?.plan || 'trial');
+}
+
 /** Pareamento: o app envia o código exibido no PC; o PC sai da fila e vira o PC do usuário. */
-app.post('/api/pair', authHttp, async (req, res) => {
+app.post('/api/pair', authHttp, rateLimit(15), async (req, res) => {
   const userId = await resolveUserId(req);
-  if (userId === DEFAULT_USER_ID) return res.status(401).json({ ok: false, error: 'LOGIN_NECESSARIO' });
+  if (!userId || userId === DEFAULT_USER_ID) return res.status(401).json({ ok: false, error: 'LOGIN_NECESSARIO' });
   const code = String(req.body?.code || '').trim();
 
   // Limpa expirados
@@ -480,7 +531,14 @@ app.get('/api/pc/status', authHttp, async (req, res) => {
   res.json({ ok: true, userId, online: Boolean(pc), streamHost: pc?.streamHost || '', lanHost: pc?.lanHost || '' });
 });
 
-app.get('/api/debug/pcs', authHttp, (req, res) => {
+app.get('/api/debug/pcs', authHttp, async (req, res) => {
+  // Só contas admin enxergam o mapa de PCs de todos os usuários
+  const userId = await resolveUserId(req);
+  const admins = (process.env.ADMIN_EMAILS || 'admin@gmail.com').split(',').map(s => s.trim().toLowerCase());
+  const acc = userId ? await dbGet('SELECT email FROM accounts WHERE userId = ?', userId).catch(() => null) : null;
+  if (!acc || !admins.includes(String(acc.email).toLowerCase())) {
+    return res.status(403).json({ ok: false, error: 'ADMIN_ONLY' });
+  }
   res.json({ ok: true, pcs: Object.fromEntries(pcSockets) });
 });
 
@@ -583,9 +641,9 @@ const CHECKOUT_GATEWAY_URL = process.env.CHECKOUT_GATEWAY_URL || ''; // ex.: ini
 const DEV_CONFIRM = process.env.CHECKOUT_DEV_CONFIRM === '1';
 
 /** App pede um link de pagamento → abre no navegador. */
-app.post('/api/checkout', authHttp, async (req, res) => {
+app.post('/api/checkout', authHttp, rateLimit(10), async (req, res) => {
   const userId = await resolveUserId(req);
-  if (userId === DEFAULT_USER_ID) return res.status(401).json({ ok: false, error: 'LOGIN_NECESSARIO' });
+  if (!userId || userId === DEFAULT_USER_ID) return res.status(401).json({ ok: false, error: 'LOGIN_NECESSARIO' });
   const plano = PLANOS[String(req.body?.plan || 'pro')] || PLANOS.pro;
   const sid = crypto.randomBytes(16).toString('hex');
   try {
@@ -603,9 +661,12 @@ async function markCheckoutPaid(sid, origem) {
   const c = await dbGet('SELECT * FROM checkouts WHERE sid = ?', sid);
   if (!c) return null;
   if (c.status !== 'paid') {
+    // Renovação soma 30 dias a partir de agora ou do fim do plano atual (o que for maior)
+    const acc = await dbGet('SELECT planExpiresAt FROM accounts WHERE userId = ?', c.userId).catch(() => null);
+    const base = Math.max(Date.now(), acc?.planExpiresAt || 0);
     await dbRun("UPDATE checkouts SET status='paid', paidAt=? WHERE sid=?", Date.now(), sid);
-    await dbRun("UPDATE accounts SET plan='pro' WHERE userId=?", c.userId);
-    log(`[CHECKOUT] pago sid=${sid} user=${c.userId} via ${origem}`);
+    await dbRun("UPDATE accounts SET plan='pro', planExpiresAt=? WHERE userId=?", base + 30 * 24 * 60 * 60 * 1000, c.userId);
+    log(`[CHECKOUT] pago sid=${sid} user=${c.userId} via ${origem} → +30d`);
   }
   return c;
 }
@@ -630,8 +691,8 @@ app.post('/api/pay/webhook', async (req, res) => {
   res.json({ ok: Boolean(c) });
 });
 
-/** App faz polling depois que o usuário volta do navegador. */
-app.get('/api/checkout/:sid/status', authHttp, async (req, res) => {
+/** App/página faz polling — o sid (16 bytes) já é o segredo; sem authHttp. */
+app.get('/api/checkout/:sid/status', async (req, res) => {
   const c = await dbGet('SELECT status, plan FROM checkouts WHERE sid = ?', req.params.sid).catch(() => null);
   if (!c) return res.status(404).json({ ok: false, error: 'SID_INVALIDO' });
   res.json({ ok: true, status: c.status, plan: c.plan });
