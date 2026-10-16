@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const crypto = require('crypto');
 const { io } = require('socket.io-client');
 
 // Carrega .env ao lado do script (Node >=20.12); ignora se não existir
@@ -10,14 +11,30 @@ const { loadLibrary, searchLibrary, syncSources, watchLibrary, DIR_LIBRARY } = r
 const { DownloadManager, defaultDownloadDir } = require('./downloads');
 const sunshine = require('./sunshine');
 
-const USER_ID = process.env.UBIKA_USER_ID || 'utilizador_teste_123';
+const ENV_PATH = path.join(__dirname, '.env');
+const envUserId = (process.env.UBIKA_USER_ID || '').trim();
+// Sem usuário real (ou o id de teste) o daemon entra em modo de pareamento
+const PAIRED = envUserId && envUserId !== 'utilizador_teste_123';
+let USER_ID = PAIRED ? envUserId : '';
 const DEVICE_ID = process.env.UBIKA_DEVICE_ID || `${os.hostname()}-${process.platform}`;
 const SERVER_URL = process.env.UBIKA_SERVER || 'http://localhost:3000';
 const SHARED_SECRET = process.env.UBIKA_SHARED_SECRET || '';
 const STREAM_HOST = process.env.UBIKA_STREAM_HOST || detectBestIp();
 const SYNC_INTERVAL_MS = Number.parseInt(process.env.UBIKA_SYNC_INTERVAL_MS || `${6 * 60 * 60 * 1000}`, 10); // 6h
+const PAIR_CODE = PAIRED ? '' : String(crypto.randomInt(100000, 999999));
 
 const log = (...args) => console.log(new Date().toISOString(), ...args);
+
+function saveUserIdToEnv(userId) {
+  try {
+    let env = fs.existsSync(ENV_PATH) ? fs.readFileSync(ENV_PATH, 'utf8') : '';
+    if (/^UBIKA_USER_ID=.*$/m.test(env)) env = env.replace(/^UBIKA_USER_ID=.*$/m, `UBIKA_USER_ID=${userId}`);
+    else env += `\nUBIKA_USER_ID=${userId}`;
+    fs.writeFileSync(ENV_PATH, env);
+  } catch (err) {
+    log(`[PAIR] não consegui gravar .env: ${err.message}`);
+  }
+}
 
 /** Prefere o IP do overlay (Tailscale 100.64.0.0/10); senão, primeiro IPv4 de LAN. */
 function detectBestIp() {
@@ -36,7 +53,7 @@ function detectBestIp() {
 // ---------- Downloads ----------
 const downloadDir = defaultDownloadDir();
 const downloads = new DownloadManager(downloadDir, (snap) => {
-  if (socket.connected) socket.emit('download_progress', { userId: USER_ID, ...snap });
+  if (socket.connected && USER_ID) socket.emit('download_progress', { userId: USER_ID, ...snap });
 });
 downloads.init().then(() => downloads.start());
 
@@ -155,7 +172,7 @@ async function executeCommand(payload, ack) {
 // ---------- Socket ----------
 const socket = io(SERVER_URL, {
   auth: { token: SHARED_SECRET },
-  query: { device: 'pc', userId: USER_ID },
+  query: PAIRED ? { device: 'pc', userId: USER_ID } : { device: 'pc' },
   reconnection: true,
   reconnectionDelay: 1000,
   reconnectionDelayMax: 10000,
@@ -164,13 +181,39 @@ const socket = io(SERVER_URL, {
 
 socket.on('connect', () => {
   log(`[SOCKET] conectado server=${SERVER_URL} socket=${socket.id}`);
+  if (PAIRED) {
+    socket.emit('registrar_pc', {
+      userId: USER_ID,
+      deviceId: DEVICE_ID,
+      streamHost: STREAM_HOST,
+    }, (ack) => {
+      log(`[REGISTRO] ${JSON.stringify(ack)}`);
+    });
+  } else {
+    // Modo pareamento: registra com código e aguarda o app digitar
+    socket.emit('registrar_pc', {
+      pairCode: PAIR_CODE,
+      deviceId: DEVICE_ID,
+      streamHost: STREAM_HOST,
+    }, (ack) => {
+      log(`[PAIR] ${JSON.stringify(ack)}`);
+    });
+  }
+});
+
+// Servidor confirma o pareamento: grava o userId real e re-registra
+socket.on('pareado', (data) => {
+  const userId = String(data?.userId || '').trim();
+  if (!userId) return;
+  log(`[PAIR] pareado com user=${userId}`);
+  saveUserIdToEnv(userId);
+  process.env.UBIKA_USER_ID = userId;
+  USER_ID = userId;
   socket.emit('registrar_pc', {
-    userId: USER_ID,
+    userId,
     deviceId: DEVICE_ID,
     streamHost: STREAM_HOST,
-  }, (ack) => {
-    log(`[REGISTRO] ${JSON.stringify(ack)}`);
-  });
+  }, (ack) => log(`[REGISTRO] ${JSON.stringify(ack)}`));
 });
 
 socket.on('connect_error', err => log(`[SOCKET] connect_error ${err.message}`));
@@ -194,7 +237,7 @@ socket.on('pedir_pesquisa_jogos', (data, ack) => {
 socket.on('executar_comando', (payload, ack) => executeCommand(payload, ack || (() => {})));
 
 setInterval(() => {
-  if (socket.connected) socket.emit('pc_heartbeat', { userId: USER_ID });
+  if (socket.connected && USER_ID) socket.emit('pc_heartbeat', { userId: USER_ID });
 }, 5000);
 
 // ---------- Boot ----------
@@ -205,4 +248,19 @@ if (SYNC_INTERVAL_MS > 0) {
   setInterval(() => syncSources().then(r => log(`[SYNC] periódico: ${JSON.stringify(r)}`)), SYNC_INTERVAL_MS);
 }
 
-log(`🟢 Ubika PC Daemon ativo user=${USER_ID} device=${DEVICE_ID} streamHost=${STREAM_HOST || 'n/a'} engine=${downloads.engineName} dir=${downloadDir}`);
+if (!PAIRED) {
+  // Código visível no console e num arquivo pra usuário digitar no app
+  const banner = [
+    '',
+    '  ╔══════════════════════════════════════╗',
+    '  ║   CÓDIGO DE PAREAMENTO UBIKA         ║',
+    `  ║            ${PAIR_CODE}                  ║`,
+    '  ║   Digite este código no app mobile   ║',
+    '  ╚══════════════════════════════════════╝',
+    '',
+  ].join('\n');
+  console.log(banner);
+  try { fs.writeFileSync(path.join(__dirname, 'PAREAR.txt'), `Código de pareamento Ubika: ${PAIR_CODE}\nVálido por 10 minutos. Digite no app mobile.\n`); } catch {}
+}
+
+log(`🟢 Ubika PC Daemon ativo user=${USER_ID || '(aguardando pareamento)'} device=${DEVICE_ID} streamHost=${STREAM_HOST || 'n/a'} engine=${downloads.engineName} dir=${downloadDir}`);

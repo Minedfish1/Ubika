@@ -173,7 +173,67 @@ db.serialize(() => {
     status TEXT,
     date TEXT
   )`);
+  // Auth real: userId público (uuid) usado nas salas/registros de PC
+  db.run(`CREATE TABLE IF NOT EXISTS accounts (
+    userId TEXT PRIMARY KEY,
+    email TEXT UNIQUE NOT NULL,
+    passHash TEXT NOT NULL,
+    salt TEXT NOT NULL,
+    plan TEXT DEFAULT 'trial',
+    trialEndsAt INTEGER,
+    createdAt INTEGER NOT NULL
+  )`);
+  db.run(`CREATE TABLE IF NOT EXISTS sessions (
+    token TEXT PRIMARY KEY,
+    userId TEXT NOT NULL,
+    createdAt INTEGER NOT NULL
+  )`);
 });
+
+// PCs aguardando pareamento: code -> { socketId, deviceId, streamHost, expiresAt }
+const pendingPcs = new Map();
+const PAIR_TTL_MS = 10 * 60 * 1000;
+
+const dbGet = (sql, ...args) => new Promise((res, rej) => db.get(sql, args, (e, r) => e ? rej(e) : res(r)));
+const dbRun = (sql, ...args) => new Promise((res, rej) => db.run(sql, args, function (e) { return e ? rej(e) : res(this); }));
+
+function hashPassword(password, salt) {
+  return crypto.scryptSync(String(password), salt, 64).toString('hex');
+}
+
+async function createSession(userId) {
+  const token = crypto.randomBytes(32).toString('hex');
+  await dbRun('INSERT INTO sessions (token, userId, createdAt) VALUES (?,?,?)', token, userId, Date.now());
+  return token;
+}
+
+/** userId do request: sessão (header/query) tem prioridade; senão userId legado; senão default. */
+async function resolveUserId(req) {
+  const token = String(req.header('x-ubika-session') || req.query.session || req.body?.session || '');
+  if (token) {
+    const s = await dbGet('SELECT userId FROM sessions WHERE token = ?', token).catch(() => null);
+    if (s) return s.userId;
+  }
+  const legacy = String(req.query.userId || req.body?.userId || '').trim();
+  return legacy || DEFAULT_USER_ID;
+}
+
+function registerPc(userId, socket, data) {
+  removePcBySocket(socket.id);
+  const old = pcSockets.get(userId);
+  if (old && old.socketId !== socket.id) {
+    io.sockets.sockets.get(old.socketId)?.disconnect(true);
+  }
+  const deviceId = String(data?.deviceId || socket.id);
+  const streamHost = String(data?.streamHost || process.env.DEFAULT_STREAM_HOST || '').trim();
+  pcSockets.set(userId, { socketId: socket.id, deviceId, streamHost, lastSeen: Date.now() });
+  socket.data.role = 'pc';
+  socket.data.userId = userId;
+  socket.join(`user:${userId}`);
+  log(`[PC] registrado user=${userId} socket=${socket.id} device=${deviceId} streamHost=${streamHost || 'n/a'}`);
+  io.to(`user:${userId}`).emit('pc_status', { userId, online: true, streamHost });
+  return { deviceId, streamHost };
+}
 
 // ------------------------- Socket.io -------------------------
 io.on('connection', (socket) => {
@@ -198,28 +258,29 @@ io.on('connection', (socket) => {
 
   socket.on('registrar_pc', (data, ack) => {
     const userId = String(data?.userId || '').trim();
+    const pairCode = String(data?.pairCode || '').trim();
+
+    // Fluxo novo: PC sem usuário entra na fila de pareamento e espera o app digitar o código
+    if (!userId && pairCode) {
+      pendingPcs.set(pairCode, {
+        socketId: socket.id,
+        deviceId: String(data?.deviceId || socket.id),
+        streamHost: String(data?.streamHost || '').trim(),
+        expiresAt: Date.now() + PAIR_TTL_MS,
+      });
+      socket.data.role = 'pc_pending';
+      log(`[PC] aguardando pareamento code=${pairCode} socket=${socket.id}`);
+      return ack?.({ ok: true, pending: true, pairCode, ttlMs: PAIR_TTL_MS });
+    }
+
     if (!userId) {
       const response = { ok: false, error: 'USER_ID_REQUIRED' };
       ack?.(response);
       return;
     }
 
-    removePcBySocket(socket.id);
-    const old = pcSockets.get(userId);
-    if (old && old.socketId !== socket.id) {
-      io.sockets.sockets.get(old.socketId)?.disconnect(true);
-    }
-
-    const deviceId = String(data?.deviceId || socket.id);
-    const streamHost = String(data?.streamHost || process.env.DEFAULT_STREAM_HOST || '').trim();
-    pcSockets.set(userId, { socketId: socket.id, deviceId, streamHost, lastSeen: Date.now() });
-    socket.data.role = 'pc';
-    socket.data.userId = userId;
-
-    log(`[PC] registrado user=${userId} socket=${socket.id} device=${deviceId} streamHost=${streamHost || 'n/a'}`);
-    socket.join(`user:${userId}`);
-    ack?.({ ok: true, userId, socketId: socket.id, streamHost });
-    io.to(`user:${userId}`).emit('pc_status', { userId, online: true, streamHost });
+    const { deviceId, streamHost } = registerPc(userId, socket, data);
+    ack?.({ ok: true, userId, socketId: socket.id, streamHost, deviceId });
   });
 
   socket.on('registrar_android', (data, ack) => {
@@ -293,8 +354,81 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-app.get('/api/pc/status', authHttp, (req, res) => {
-  const userId = String(req.query.userId || DEFAULT_USER_ID);
+// ------------------------- Auth -------------------------
+app.post('/api/auth/register', async (req, res) => {
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  const password = String(req.body?.password || '');
+  if (!/^\S+@\S+\.\S+$/.test(email)) return res.status(400).json({ ok: false, error: 'EMAIL_INVALIDO' });
+  if (password.length < 6) return res.status(400).json({ ok: false, error: 'SENHA_CURTA_MIN_6' });
+
+  try {
+    const exists = await dbGet('SELECT userId FROM accounts WHERE email = ?', email);
+    if (exists) return res.status(409).json({ ok: false, error: 'EMAIL_JA_CADASTRADO' });
+
+    const userId = crypto.randomUUID();
+    const salt = crypto.randomBytes(16).toString('hex');
+    const passHash = hashPassword(password, salt);
+    const trialEndsAt = Date.now() + 7 * 24 * 60 * 60 * 1000; // 7 dias
+    await dbRun(
+      'INSERT INTO accounts (userId, email, passHash, salt, plan, trialEndsAt, createdAt) VALUES (?,?,?,?,?,?,?)',
+      userId, email, passHash, salt, 'trial', trialEndsAt, Date.now()
+    );
+    const token = await createSession(userId);
+    log(`[AUTH] registrado user=${userId} email=${email}`);
+    res.json({ ok: true, token, userId, email, plan: 'trial', trialEndsAt });
+  } catch (err) {
+    log(`[AUTH] register erro: ${err.message}`);
+    res.status(500).json({ ok: false, error: 'REGISTER_FAILED' });
+  }
+});
+
+app.post('/api/auth/login', async (req, res) => {
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  const password = String(req.body?.password || '');
+  try {
+    const acc = await dbGet('SELECT * FROM accounts WHERE email = ?', email);
+    if (!acc || hashPassword(password, acc.salt) !== acc.passHash) {
+      return res.status(401).json({ ok: false, error: 'CREDENCIAIS_INVALIDAS' });
+    }
+    const token = await createSession(acc.userId);
+    log(`[AUTH] login user=${acc.userId}`);
+    res.json({ ok: true, token, userId: acc.userId, email: acc.email, plan: acc.plan, trialEndsAt: acc.trialEndsAt });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: 'LOGIN_FAILED' });
+  }
+});
+
+app.get('/api/auth/me', authHttp, async (req, res) => {
+  const token = String(req.header('x-ubika-session') || req.query.session || '');
+  const s = token ? await dbGet('SELECT userId FROM sessions WHERE token = ?', token).catch(() => null) : null;
+  if (!s) return res.status(401).json({ ok: false, error: 'SESSAO_INVALIDA' });
+  const acc = await dbGet('SELECT userId, email, plan, trialEndsAt FROM accounts WHERE userId = ?', s.userId).catch(() => null);
+  res.json({ ok: true, userId: s.userId, email: acc?.email, plan: acc?.plan, trialEndsAt: acc?.trialEndsAt });
+});
+
+/** Pareamento: o app envia o código exibido no PC; o PC sai da fila e vira o PC do usuário. */
+app.post('/api/pair', authHttp, async (req, res) => {
+  const userId = await resolveUserId(req);
+  if (userId === DEFAULT_USER_ID) return res.status(401).json({ ok: false, error: 'LOGIN_NECESSARIO' });
+  const code = String(req.body?.code || '').trim();
+
+  // Limpa expirados
+  for (const [c, p] of pendingPcs) if (p.expiresAt < Date.now()) pendingPcs.delete(c);
+
+  const pending = pendingPcs.get(code);
+  if (!pending) return res.status(404).json({ ok: false, error: 'CODIGO_INVALIDO_OU_EXPIRADO' });
+  const socket = io.sockets.sockets.get(pending.socketId);
+  if (!socket) { pendingPcs.delete(code); return res.status(410).json({ ok: false, error: 'PC_DESCONECTOU' }); }
+
+  pendingPcs.delete(code);
+  registerPc(userId, socket, pending);
+  socket.emit('pareado', { userId, deviceId: pending.deviceId });
+  log(`[PAIR] user=${userId} code=${code} device=${pending.deviceId}`);
+  res.json({ ok: true, userId, deviceId: pending.deviceId, streamHost: pending.streamHost });
+});
+
+app.get('/api/pc/status', authHttp, async (req, res) => {
+  const userId = await resolveUserId(req);
   const pc = getPc(userId);
   res.json({ ok: true, userId, online: Boolean(pc), streamHost: pc?.streamHost || '' });
 });
@@ -341,7 +475,7 @@ app.get('/api/trending', authHttp, async (req, res) => {
 });
 
 app.get('/api/games', authHttp, async (req, res) => {
-  const userId = String(req.query.userId || DEFAULT_USER_ID).trim();
+  const userId = await resolveUserId(req);
   const search = String(req.query.search || '').slice(0, 100);
   const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
 
@@ -360,7 +494,7 @@ app.get('/api/games', authHttp, async (req, res) => {
 });
 
 app.post('/api/pc/command', authHttp, async (req, res) => {
-  const userId = String(req.body?.userId || DEFAULT_USER_ID).trim();
+  const userId = await resolveUserId(req);
   const action = String(req.body?.action || '').trim();
   const payload = req.body?.payload && typeof req.body.payload === 'object' ? req.body.payload : {};
   const allowed = new Set([
@@ -382,8 +516,8 @@ app.post('/api/pc/command', authHttp, async (req, res) => {
   }
 });
 
-app.get('/api/stream', authHttp, (req, res) => {
-  const userId = String(req.query.userId || DEFAULT_USER_ID).trim();
+app.get('/api/stream', authHttp, async (req, res) => {
+  const userId = await resolveUserId(req);
   const pc = getPc(userId);
   if (!pc) return res.status(503).json({ ok: false, error: 'PC_OFFLINE' });
   res.json({
