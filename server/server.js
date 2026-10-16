@@ -17,6 +17,12 @@ const PC_COMMAND_TIMEOUT = Number.parseInt(process.env.PC_COMMAND_TIMEOUT_MS, 10
 const TRENDING_TTL_MS = Number.parseInt(process.env.TRENDING_TTL_MS, 10) || 10 * 60 * 1000;
 const FALLBACK_COVER = process.env.FALLBACK_COVER || 'https://i.imgur.com/vHq0rDk.png';
 
+const fs = require('fs');
+const path = require('path');
+const PUBLIC_URL = process.env.PUBLIC_URL || `http://18.223.108.137:${PORT}`;
+const COVERS_DIR = path.join(process.env.COVERS_DIR || __dirname, 'covers');
+try { fs.mkdirSync(COVERS_DIR, { recursive: true }); } catch {}
+
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -108,6 +114,7 @@ function cleanTitle(title) {
   t = t.replace(/[*©®™]/g, ' ');
   t = t.replace(/\bv\s*\d[\d.\s]*/gi, ' ');           // "v 5 00с", "v1.2.3" soltos
   t = t.replace(/[^\x20-\x7E]/g, ' ');               // cirílico/unicode dos repacks
+  t = t.replace(/(\s+v?\d[\d.]*)+\s*$/gi, ' ');      // "1 112 1610 0" — versões soltas no fim
   return t.replace(/\s{2,}/g, ' ').trim() || String(title || '');
 }
 
@@ -131,11 +138,14 @@ async function rawgEnrich(game) {
   const key = searchTitle.toLowerCase();
 
   // 1º) banco local — já enriquecido uma vez = zero chamadas de rede
-  const meta = await dbGet('SELECT * FROM game_meta WHERE key = ?', metaKey(game.title)).catch(() => null);
+  const mkey = metaKey(game.title);
+  const meta = await dbGet('SELECT * FROM game_meta WHERE key = ?', mkey).catch(() => null);
   if (meta) {
+    // Capa aponta pra /covers/ na VPS — espelha no disco no 1º acesso
+    const localCover = meta.coverUrl ? `${PUBLIC_URL}/covers/${mkey.replace(/\s+/g, '-')}.jpg` : null;
     return {
       ...game,
-      coverUrl: hasCover ? game.coverUrl : (meta.coverUrl || FALLBACK_COVER),
+      coverUrl: hasCover ? game.coverUrl : (localCover || FALLBACK_COVER),
       description: hasDesc ? game.description : (meta.description || 'Sem descrição disponível.'),
       requirements: hasReq ? game.requirements : (meta.requirements || null),
     };
@@ -175,19 +185,23 @@ async function rawgEnrich(game) {
   // RAWG quase nunca tem requisitos — Steam appdetails tem (grátis, sem key)
   if (!game.requirements && !reqText) reqText = await steamRequirements(searchTitle);
 
-  const coverUrl = hasCover ? game.coverUrl : (r.background_image || FALLBACK_COVER);
+  const remoteCover = hasCover ? game.coverUrl : (r.background_image || null);
   const description = hasDesc ? game.description : (r.description_raw || 'Sem descrição disponível.');
   const requirements = game.requirements || reqText || null;
 
   // Persiste no SQLite — próximas buscas desse jogo saem do DB, sem rede
-  if (coverUrl !== FALLBACK_COVER || description !== 'Sem descrição disponível.' || requirements) {
+  if (remoteCover || description !== 'Sem descrição disponível.' || requirements) {
     dbRun('INSERT OR REPLACE INTO game_meta (key,coverUrl,description,requirements,updatedAt) VALUES (?,?,?,?,?)',
-      metaKey(game.title), coverUrl !== FALLBACK_COVER ? coverUrl : null,
+      mkey, remoteCover !== FALLBACK_COVER ? remoteCover : null,
       description !== 'Sem descrição disponível.' ? description : null,
       requirements, Date.now()
     ).catch(err => log(`[META] gravação falhou: ${err.message}`));
   }
 
+  // Capa real → aponta pro espelho /covers/ da VPS (baixa do RAWG sob demanda)
+  const coverUrl = remoteCover && remoteCover !== FALLBACK_COVER
+    ? `${PUBLIC_URL}/covers/${mkey.replace(/\s+/g, '-')}.jpg`
+    : (remoteCover || FALLBACK_COVER);
   return { ...game, coverUrl, description, requirements };
 }
 
@@ -687,6 +701,25 @@ app.get('/api/trending', authHttp, async (req, res) => {
     if (trendingCache.games.length) return res.json({ ok: true, games: trendingCache.games, source: 'stale-cache' });
     return res.status(502).json({ ok: false, error: 'TRENDING_UNAVAILABLE', games: [] });
   }
+});
+
+// Capas espelhadas: /covers/<titulo-slug>.jpg → serve do disco; se faltar, baixa do RAWG e guarda
+app.get('/covers/:file', async (req, res) => {
+  const file = path.basename(String(req.params.file || ''));
+  const fp = path.join(COVERS_DIR, file);
+  res.setHeader('Cache-Control', 'public, max-age=2592000');
+  if (fs.existsSync(fp)) return res.sendFile(fp);
+
+  // descobre a URL original no game_meta (o slug vira a key com espaços)
+  const key = file.replace(/\.jpg$/i, '').replace(/-/g, ' ');
+  const meta = await dbGet('SELECT coverUrl FROM game_meta WHERE key = ?', key).catch(() => null);
+  if (!meta?.coverUrl) return res.status(404).end();
+  try {
+    const img = await axios.get(meta.coverUrl, { responseType: 'arraybuffer', timeout: 8000, maxContentLength: 10 * 1024 * 1024 });
+    fs.writeFileSync(fp, img.data);
+    res.setHeader('Content-Type', 'image/jpeg');
+    res.end(img.data);
+  } catch { res.status(502).end(); }
 });
 
 app.get('/api/games', authHttp, async (req, res) => {
