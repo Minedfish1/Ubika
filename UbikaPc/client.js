@@ -299,6 +299,16 @@ socket.on('connect', () => {
   announcePc();
 });
 
+// 'io server disconnect' = a VPS derrubou este socket (outra instância ou
+// registro concorrente). O socket.io-client NÃO reconecta sozinho nesse caso —
+// o daemon ficava com GUI viva e relay morto pra sempre. Força reconexão.
+socket.on('disconnect', (reason) => {
+  if (reason === 'io server disconnect') {
+    log('[SOCKET] servidor derrubou a conexão — reconectando em 3s');
+    setTimeout(() => { try { socket.connect(); } catch {} }, 3000);
+  }
+});
+
 // Mantém o código vivo na VPS (ela zera pendingPcs ao reiniciar) e rotaciona a cada ~9min
 setInterval(() => {
   if (Date.now() >= pairCodeExpiresAt) {
@@ -349,6 +359,19 @@ setInterval(() => {
 }, 5000);
 
 // ---------- Boot ----------
+// Instância única: duas instâncias disputam o registro na VPS e se derrubam
+// em loop (cada registrar_pc mata o socket da outra). Porta-mutex decide.
+try {
+  const lock = require('net').createServer();
+  lock.on('error', (e) => {
+    if (e.code === 'EADDRINUSE') {
+      console.log('[UBIKA] Outra instância do daemon já está rodando — saindo.');
+      process.exit(0);
+    }
+  });
+  lock.listen(47891, '127.0.0.1');
+} catch {}
+
 loadLibrary();
 watchLibrary();
 syncSources().then(r => log(`[SYNC] inicial: ${JSON.stringify(r)}`));

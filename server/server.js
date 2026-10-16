@@ -282,8 +282,16 @@ function clientIp(socket) {
 }
 
 function registerPc(userId, socket, data) {
-  removePcBySocket(socket.id);
   const old = pcSockets.get(userId);
+  // Re-anúncio do MESMO socket (daemon re-registra a cada 30s): só atualiza
+  // metadados — remover e re-adicionar gerava ruído e risco de corrida.
+  if (old && old.socketId === socket.id) {
+    old.streamHost = clientIp(socket) || old.streamHost;
+    old.lanHost = String(data?.lanIp || '').trim() || old.lanHost;
+    old.lastSeen = Date.now();
+    return { deviceId: old.deviceId, streamHost: old.streamHost };
+  }
+  removePcBySocket(socket.id);
   if (old && old.socketId !== socket.id) {
     io.sockets.sockets.get(old.socketId)?.disconnect(true);
   }
