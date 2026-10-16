@@ -47,7 +47,12 @@ function refreshPublicIp() {
 refreshPublicIp();
 setInterval(refreshPublicIp, 10 * 60 * 1000); // revalida a cada 10 min (IP dinâmico)
 const SYNC_INTERVAL_MS = Number.parseInt(process.env.UBIKA_SYNC_INTERVAL_MS || `${6 * 60 * 60 * 1000}`, 10); // 6h
-const PAIR_CODE = PAIRED ? '' : String(crypto.randomInt(100000, 999999));
+// Código de pareamento SEMPRE ativo: rotaciona antes do TTL do servidor (10min)
+// e é re-registrado a cada 30s — continua válido após restart da VPS e serve
+// para parear um novo aparelho mesmo com o PC já pareado.
+const PAIR_ROTATE_MS = 9 * 60 * 1000;
+let pairCode = String(crypto.randomInt(100000, 999999));
+let pairCodeExpiresAt = Date.now() + PAIR_ROTATE_MS;
 
 const log = (...args) => console.log(new Date().toISOString(), ...args);
 
@@ -275,29 +280,34 @@ const socket = io(SERVER_URL, {
   timeout: 10000,
 });
 
+/** Anuncia o PC na VPS: userId (se pareado) + código de pareamento sempre válido. */
+function announcePc() {
+  socket.emit('registrar_pc', {
+    userId: USER_ID || undefined,
+    pairCode,
+    deviceId: DEVICE_ID,
+    lanIp: LAN_IP,
+    streamHost: PUBLIC_IP || LAN_IP,
+  }, (ack) => {
+    log(`[REGISTRO] ${JSON.stringify(ack)}`);
+  });
+}
+
 socket.on('connect', () => {
   log(`[SOCKET] conectado server=${SERVER_URL} socket=${socket.id}`);
-  if (PAIRED) {
-    socket.emit('registrar_pc', {
-      userId: USER_ID,
-      deviceId: DEVICE_ID,
-      lanIp: LAN_IP,
-      streamHost: PUBLIC_IP || LAN_IP,
-    }, (ack) => {
-      log(`[REGISTRO] ${JSON.stringify(ack)}`);
-    });
-  } else {
-    // Modo pareamento: registra com código e aguarda o app digitar
-    socket.emit('registrar_pc', {
-      pairCode: PAIR_CODE,
-      deviceId: DEVICE_ID,
-      lanIp: LAN_IP,
-      streamHost: PUBLIC_IP || LAN_IP,
-    }, (ack) => {
-      log(`[PAIR] ${JSON.stringify(ack)}`);
-    });
-  }
+  announcePc();
 });
+
+// Mantém o código vivo na VPS (ela zera pendingPcs ao reiniciar) e rotaciona a cada ~9min
+setInterval(() => {
+  if (Date.now() >= pairCodeExpiresAt) {
+    pairCode = String(crypto.randomInt(100000, 999999));
+    pairCodeExpiresAt = Date.now() + PAIR_ROTATE_MS;
+    publishPairCode();
+    log(`[PAIR] código rotacionado → ${pairCode}`);
+  }
+  if (socket.connected) announcePc();
+}, 30 * 1000);
 
 // Servidor confirma o pareamento: grava o userId real e re-registra
 socket.on('pareado', (data) => {
@@ -307,12 +317,7 @@ socket.on('pareado', (data) => {
   saveUserIdToEnv(userId);
   process.env.UBIKA_USER_ID = userId;
   USER_ID = userId;
-  socket.emit('registrar_pc', {
-    userId,
-    deviceId: DEVICE_ID,
-    lanIp: LAN_IP,
-    streamHost: PUBLIC_IP || LAN_IP,
-  }, (ack) => log(`[REGISTRO] ${JSON.stringify(ack)}`));
+  announcePc();
 });
 
 // VPS avisa que o último app desse usuário saiu → restaura display se não há stream
@@ -350,20 +355,25 @@ if (SYNC_INTERVAL_MS > 0) {
   setInterval(() => syncSources().then(r => log(`[SYNC] periódico: ${JSON.stringify(r)}`)), SYNC_INTERVAL_MS);
 }
 
-if (!PAIRED) {
-  // Código visível no console e num arquivo pra usuário digitar no app
+/** Código sempre visível: console + PAREAR.txt (atualizado a cada rotação). */
+function publishPairCode() {
   const banner = [
     '',
     '  ╔══════════════════════════════════════╗',
     '  ║   CÓDIGO DE PAREAMENTO UBIKA         ║',
-    `  ║            ${PAIR_CODE}                  ║`,
+    `  ║            ${pairCode}                  ║`,
     '  ║   Digite este código no app mobile   ║',
+    '  ║   (troca a cada ~9 minutos)          ║',
     '  ╚══════════════════════════════════════╝',
     '',
   ].join('\n');
   console.log(banner);
-  try { fs.writeFileSync(path.join(BASE_DIR, 'PAREAR.txt'), `Código de pareamento Ubika: ${PAIR_CODE}\nVálido por 10 minutos. Digite no app mobile.\n`); } catch {}
+  try {
+    fs.writeFileSync(path.join(BASE_DIR, 'PAREAR.txt'),
+      `Código de pareamento Ubika: ${pairCode}\nTroca a cada ~9 minutos — use sempre o mais recente (console ou painel).\n`);
+  } catch {}
 }
+publishPairCode();
 
 log(`🟢 Ubika PC Daemon ativo user=${USER_ID || '(aguardando pareamento)'} device=${DEVICE_ID} lanIp=${LAN_IP || 'n/a'} engine=${downloads.engineName} dir=${downloadDir}`);
 
@@ -374,7 +384,8 @@ try {
     const st = sunshine.streamStatus();
     return {
       paired: Boolean(USER_ID),
-      pairCode: USER_ID ? '' : PAIR_CODE,
+      pairCode,
+      pairCodeTtlSec: Math.max(0, Math.round((pairCodeExpiresAt - Date.now()) / 1000)),
       userId: USER_ID,
       deviceId: DEVICE_ID,
       lanIp: LAN_IP,

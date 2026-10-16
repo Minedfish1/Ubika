@@ -87,14 +87,32 @@ function sanitizeGame(game, page, index) {
   };
 }
 
+/** Remove o lixo do nome do repack (versão, DLCs, MULTi) antes de buscar no RAWG. */
+function cleanTitle(title) {
+  let t = String(title || '');
+  t = t.replace(/\([^)]*\)/g, ' ');
+  t = t.replace(/\[[^\]]*\]/g, ' ');
+  t = t.replace(/\s[–—-]\s*v?\d[\d.]*\b/gi, ' ');
+  t = t.replace(/\+\s*\d+\s*DLCs?\*?/gi, ' ');
+  t = t.replace(/\bMULTi\w*\b/gi, ' ');
+  t = t.replace(/\bv?\d+\.\d+(\.\d+)*\b/gi, ' ');
+  t = t.replace(/\bbuild\s*\d+\b/gi, ' ');
+  t = t.replace(/[*©®™]/g, ' ');
+  return t.replace(/\s{2,}/g, ' ').trim() || String(title || '');
+}
+
 async function rawgEnrich(game) {
   if (!RAWG_API_KEY || !game?.title) return game;
-  if (game.coverUrl && game.description && game.description !== 'Sem descrição disponível.') return game;
+  // FALLBACK_COVER não conta como capa real — antes ela vencia a imagem do RAWG
+  const hasCover = Boolean(game.coverUrl) && game.coverUrl !== FALLBACK_COVER;
+  const hasDesc = Boolean(game.description) && game.description !== 'Sem descrição disponível.';
+  if (hasCover && hasDesc) return game;
 
-  const key = game.title.toLowerCase().trim();
+  const searchTitle = cleanTitle(game.title);
+  const key = searchTitle.toLowerCase();
   if (!rawgCache.has(key)) {
     rawgCache.set(key, axios.get('https://api.rawg.io/api/games', {
-      params: { key: RAWG_API_KEY, search: game.title, page_size: 1 },
+      params: { key: RAWG_API_KEY, search: searchTitle, page_size: 1 },
       timeout: 5000,
     }).then(r => r.data?.results?.[0] || null).catch(err => {
       log(`[RAWG] ${game.title}: ${err.message}`);
@@ -106,10 +124,8 @@ async function rawgEnrich(game) {
   if (!r) return game;
   return {
     ...game,
-    coverUrl: game.coverUrl || r.background_image || FALLBACK_COVER,
-    description: game.description && game.description !== 'Sem descrição disponível.'
-      ? game.description
-      : (r.description_raw || 'Sem descrição disponível.'),
+    coverUrl: hasCover ? game.coverUrl : (r.background_image || FALLBACK_COVER),
+    description: hasDesc ? game.description : (r.description_raw || 'Sem descrição disponível.'),
   };
 }
 
@@ -278,17 +294,20 @@ io.on('connection', (socket) => {
     const userId = String(data?.userId || '').trim();
     const pairCode = String(data?.pairCode || '').trim();
 
-    // Fluxo novo: PC sem usuário entra na fila de pareamento e espera o app digitar o código
-    if (!userId && pairCode) {
+    // Código sempre ativo: o PC rotaciona (~9min) e re-registra — parear funciona
+    // mesmo já pareado (novo aparelho/troca de conta) e sobrevive a restart da VPS.
+    if (pairCode) {
       pendingPcs.set(pairCode, {
         socketId: socket.id,
         deviceId: String(data?.deviceId || socket.id),
         lanIp: String(data?.lanIp || '').trim(),
         expiresAt: Date.now() + PAIR_TTL_MS,
       });
-      socket.data.role = 'pc_pending';
-      log(`[PC] aguardando pareamento code=${pairCode} socket=${socket.id}`);
-      return ack?.({ ok: true, pending: true, pairCode, ttlMs: PAIR_TTL_MS });
+      if (!userId) {
+        socket.data.role = 'pc_pending';
+        log(`[PC] aguardando pareamento code=${pairCode} socket=${socket.id}`);
+        return ack?.({ ok: true, pending: true, pairCode, ttlMs: PAIR_TTL_MS });
+      }
     }
 
     if (!userId) {
@@ -366,6 +385,7 @@ io.on('connection', (socket) => {
       }
     }
     removePcBySocket(socket.id);
+    for (const [c, p] of pendingPcs) if (p.socketId === socket.id) pendingPcs.delete(c);
     log(`[SOCKET] disconnect id=${socket.id} reason=${reason}`);
   });
 });
@@ -475,7 +495,7 @@ app.get('/api/trending', authHttp, async (req, res) => {
 
   try {
     const now = new Date();
-    const past = new Date(Date.now() - 365 * 24 * 60 * 60 * 1000);
+    const past = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
     const fmt = d => d.toISOString().slice(0, 10);
     const result = await axios.get('https://api.rawg.io/api/games', {
       params: { key: RAWG_API_KEY, ordering: '-added', dates: `${fmt(past)},${fmt(now)}`, page_size: 10 },

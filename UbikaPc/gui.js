@@ -31,11 +31,10 @@ async function tick(){
   try{
     const s = await (await fetch('/status.json')).json();
     dev.textContent = s.deviceId + '  ·  ' + (s.publicIp || s.lanIp || 'sem ip');
-    if(s.paired){
-      main.innerHTML = '<div class="paired">✓ PC CONECTADO À SUA CONTA</div><div class="codehint" style="text-align:center">Feche esta janela quando quiser — o Ubika segue rodando.</div>';
-    } else {
-      main.innerHTML = '<div class="code">'+(s.pairCode||'······')+'</div><div class="codehint" style="text-align:center">Digite este código no app Ubika do seu celular</div>';
-    }
+    const ttl = s.pairCodeTtlSec != null ? '  ·  troca em '+Math.floor(s.pairCodeTtlSec/60)+'m'+String(s.pairCodeTtlSec%60).padStart(2,'0')+'s' : '';
+    const codeBlock = '<div class="code">'+(s.pairCode||'······')+'</div><div class="codehint" style="text-align:center">'+
+      (s.paired?'Parear outro aparelho? Digite no app do celular':'Digite este código no app Ubika do seu celular')+ttl+'</div>';
+    main.innerHTML = (s.paired ? '<div class="paired">✓ PC CONECTADO</div>' : '') + codeBlock;
     const r=(k,v)=>{rows.innerHTML+='<div class="row"><span class="mut">'+k+'</span><span>'+v+'</span></div>'};
     rows.innerHTML='';
     r('Relay VPS', s.online?'<b class="ok">online</b>':'<b class="bad">offline</b>');
