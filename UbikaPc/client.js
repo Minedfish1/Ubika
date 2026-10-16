@@ -366,3 +366,28 @@ if (!PAIRED) {
 }
 
 log(`🟢 Ubika PC Daemon ativo user=${USER_ID || '(aguardando pareamento)'} device=${DEVICE_ID} lanIp=${LAN_IP || 'n/a'} engine=${downloads.engineName} dir=${downloadDir}`);
+
+// ---------- GUI local: código de pareamento + status ----------
+try {
+  const { startGui } = require('./gui');
+  startGui(Number(process.env.UBIKA_GUI_PORT) || 47890, () => {
+    const st = sunshine.streamStatus();
+    return {
+      paired: Boolean(USER_ID),
+      pairCode: USER_ID ? '' : PAIR_CODE,
+      userId: USER_ID,
+      deviceId: DEVICE_ID,
+      lanIp: LAN_IP,
+      publicIp: PUBLIC_IP,
+      online: socket.connected,
+      sunshineInstalled: st.sunshineInstalled,
+      sunshineRunning: st.sunshineRunning,
+      vddInstalled: st.vddInstalled,
+      librarySize: searchLibrary('', 1).total,
+      downloads: downloads.list().slice(-5),
+      uptime: Math.floor(process.uptime()),
+    };
+  });
+} catch (err) {
+  log(`[GUI] não subiu: ${err.message}`);
+}

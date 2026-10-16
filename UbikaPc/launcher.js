@@ -17,11 +17,40 @@ const isSea = (() => { try { return require('node:sea').isSea(); } catch { retur
 const isPackaged = isSea || !!process.pkg;
 const EXE_DIR = isPackaged ? path.dirname(process.execPath) : __dirname;
 
-// Preferência: <exe>/UbikaPc (exe na pasta Ubika) > <exe> (exe dentro de UbikaPc)
+// SEA standalone: dados extraem-se para %LOCALAPPDATA%\Ubika (exe único de verdade).
+// Junto do repo (modo dev): <exe>/UbikaPc se existir, senão <exe>.
+const STANDALONE_DIR = path.join(process.env.LOCALAPPDATA || os.homedir(), 'Ubika');
 const BASE_DIR = isPackaged
-  ? (fs.existsSync(path.join(EXE_DIR, 'UbikaPc', 'library')) ? path.join(EXE_DIR, 'UbikaPc') : EXE_DIR)
+  ? (fs.existsSync(path.join(EXE_DIR, 'UbikaPc', 'library')) ? path.join(EXE_DIR, 'UbikaPc') : STANDALONE_DIR)
   : __dirname;
 process.env.UBIKA_BASE_DIR = BASE_DIR;
+
+// Assets embutidos no SEA → extraídos na primeira execução (só os que faltam)
+const SEA_ASSETS = [
+  'sources.json',
+  'default.env',
+  'stream/display-attach.ps1', 'stream/display-detach.ps1', 'stream/install-vdd.ps1', 'stream/setup-all.ps1',
+  'driver/MttVDD.dll', 'driver/MttVDD.inf', 'driver/Virtual_Display_Driver.cer', 'driver/mttvdd.cat', 'driver/vdd_settings.xml',
+  'library/dodi.json', 'library/empress.json', 'library/fitgirl.json', 'library/gog.json',
+  'library/onlinefix.json', 'library/steamgg.json', 'library/xatab.json',
+];
+
+function extractSeaAssets() {
+  if (!isSea) return;
+  let sea;
+  try { sea = require('node:sea'); } catch { return; }
+  fs.mkdirSync(BASE_DIR, { recursive: true });
+  for (const rel of SEA_ASSETS) {
+    const dest = rel === 'default.env' ? path.join(BASE_DIR, '.env') : path.join(BASE_DIR, rel);
+    if (fs.existsSync(dest)) continue; // nunca sobrescreve dados do usuário
+    try {
+      const buf = Buffer.from(sea.getAsset(rel));
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.writeFileSync(dest, buf);
+    } catch (err) { /* asset ausente neste build — ok */ }
+  }
+}
+extractSeaAssets();
 
 // .env ao lado dos dados
 try { process.loadEnvFile(path.join(BASE_DIR, '.env')); } catch {}
@@ -68,17 +97,27 @@ function lanIp() {
   return other;
 }
 
-/** Pede UAC e instala o VDD vendored em UbikaPc\driver. Retorna true se o prompt foi lançado. */
-function installVddElevated() {
-  const ps1 = path.join(BASE_DIR, 'stream', 'install-vdd.ps1');
+/** Um prompt UAC só: instala Sunshine (winget/GitHub) + VDD + inicia o Sunshine. */
+function runSetupAllElevated() {
+  const ps1 = path.join(BASE_DIR, 'stream', 'setup-all.ps1');
   const driverDir = path.join(BASE_DIR, 'driver');
-  if (!fs.existsSync(ps1) || !fs.existsSync(path.join(driverDir, 'MttVDD.inf'))) return false;
+  if (!fs.existsSync(ps1)) return false;
   try {
-    // ArgumentList como array de strings single-quoted — paths com espaço funcionam
-    const args = `'-NoProfile','-ExecutionPolicy','Bypass','-File','${ps1}','-Source','${driverDir}'`;
-    execSync(`powershell -NoProfile -Command "Start-Process powershell -Verb RunAs -Wait -ArgumentList ${args}"`, { stdio: 'ignore', timeout: 180000 });
+    const args = `'-NoProfile','-ExecutionPolicy','Bypass','-File','${ps1}','-DriverSource','${driverDir}'`;
+    execSync(`powershell -NoProfile -Command "Start-Process powershell -Verb RunAs -Wait -ArgumentList ${args}"`, { stdio: 'ignore', timeout: 900000 });
     return true;
   } catch { return false; }
+}
+
+/** Abre a GUI local como janela-app (Edge/Chrome --app) ou navegador padrão. */
+function openGui(url) {
+  const edge = 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe';
+  const chrome = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
+  const browser = [edge, chrome].find(p => fs.existsSync(p));
+  try {
+    if (browser) exec(`"${browser}" --app=${url}`, { windowsHide: true });
+    else exec(`cmd /c start "" "${url}"`, { windowsHide: true });
+  } catch {}
 }
 
 banner();
@@ -108,18 +147,15 @@ if (st.sunshineInstalled && !st.prepConfigured) {
   }
 }
 
-if (!st.sunshineInstalled) {
-  console.log('      → Baixe o Sunshine: https://github.com/LizardByte/Sunshine/releases');
-  openUrl('https://github.com/LizardByte/Sunshine/releases');
-}
-if (!st.vddInstalled) {
-  console.log('      → Tentando instalar o VDD embutido (aceite o prompt UAC)…');
-  if (installVddElevated()) {
+if (!st.sunshineInstalled || !st.vddInstalled) {
+  console.log('      → Rodando setup completo (aceite o prompt UAC)…');
+  if (runSetupAllElevated()) {
     const again = sunshine.streamStatus();
+    console.log(`  ${ok(again.sunshineInstalled)} Sunshine   ${again.sunshineInstalled ? 'instalado' : 'não instalou — veja %ProgramData%\\Ubika\\setup-all.log'}`);
     console.log(`  ${ok(again.vddInstalled)} VDD        ${again.vddInstalled ? 'instalado agora' : 'não instalou — veja %ProgramData%\\Ubika\\install-vdd.log'}`);
   } else {
-    console.log('      → Instalação automática indisponível — rode como admin:');
-    console.log(`        powershell -File "${path.join(BASE_DIR, 'stream', 'install-vdd.ps1')}"`);
+    console.log('      → Setup automático indisponível — rode como admin:');
+    console.log(`        powershell -File "${path.join(BASE_DIR, 'stream', 'setup-all.ps1')}"`);
   }
 }
 
@@ -140,5 +176,15 @@ console.log('');
 console.log('  ── Daemon ──────────────────────────────────');
 console.log('');
 
+// ---------- GUI local (código de pareamento em janela) ----------
+const GUI_PORT = 47890;
+const guiUrl = `http://127.0.0.1:${GUI_PORT}`;
+
 // ---------- Daemon ----------
 require('./client.js');
+
+// Sobe depois do daemon para a página já responder de cara
+setTimeout(() => {
+  console.log(`  → Painel: ${guiUrl}  (abre sozinho)`);
+  openGui(guiUrl);
+}, 1500);

@@ -1,11 +1,11 @@
 {
   "sources": [
-    "https://raw.githubusercontent.com/Minedfish1/Ubika/refs/heads/main/dodi.json",
-    "https://raw.githubusercontent.com/Minedfish1/Ubika/refs/heads/main/empress.json",
-    "https://raw.githubusercontent.com/Minedfish1/Ubika/refs/heads/main/fitgirl.json",
-    "https://raw.githubusercontent.com/Minedfish1/Ubika/refs/heads/main/gog.json",
-    "https://raw.githubusercontent.com/Minedfish1/Ubika/refs/heads/main/onlinefix.json",
-    "https://raw.githubusercontent.com/Minedfish1/Ubika/refs/heads/main/steamgg.json",
-    "https://raw.githubusercontent.com/Minedfish1/Ubika/refs/heads/main/xatab.json"
+    "https://hydralinks.cloud/sources/fitgirl.json",
+    "https://hydralinks.cloud/sources/dodi.json",
+    "https://hydralinks.cloud/sources/xatab.json",
+    "https://hydralinks.cloud/sources/empress.json",
+    "https://hydralinks.cloud/sources/onlinefix.json",
+    "https://hydralinks.cloud/sources/gog.json",
+    "https://hydralinks.cloud/sources/steamrip.json"
   ]
 }
