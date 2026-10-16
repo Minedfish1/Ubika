@@ -188,6 +188,16 @@ db.serialize(() => {
     userId TEXT NOT NULL,
     createdAt INTEGER NOT NULL
   )`);
+  // Checkout web externo: o app abre /checkout/<sid> no navegador
+  db.run(`CREATE TABLE IF NOT EXISTS checkouts (
+    sid TEXT PRIMARY KEY,
+    userId TEXT NOT NULL,
+    plan TEXT NOT NULL,
+    amountCents INTEGER NOT NULL,
+    status TEXT DEFAULT 'pending',
+    createdAt INTEGER NOT NULL,
+    paidAt INTEGER
+  )`);
 });
 
 // PCs aguardando pareamento: code -> { socketId, deviceId, streamHost, expiresAt }
@@ -545,6 +555,104 @@ app.get('/api/stream', authHttp, async (req, res) => {
     lanHost: pc.lanHost || '',
     instructions: 'Use Moonlight para emparelhar com o Sunshine nesse host. A VPS não transporta o vídeo — o stream é direto.',
   });
+});
+
+// ------------------------- Checkout web externo -------------------------
+const PLANOS = { pro: { nome: 'UBIKA PRO', amountCents: 1990, descricao: 'Assinatura mensal' } };
+const CHECKOUT_GATEWAY_URL = process.env.CHECKOUT_GATEWAY_URL || ''; // ex.: init_point do Mercado Pago
+const DEV_CONFIRM = process.env.CHECKOUT_DEV_CONFIRM === '1';
+
+/** App pede um link de pagamento → abre no navegador. */
+app.post('/api/checkout', authHttp, async (req, res) => {
+  const userId = await resolveUserId(req);
+  if (userId === DEFAULT_USER_ID) return res.status(401).json({ ok: false, error: 'LOGIN_NECESSARIO' });
+  const plano = PLANOS[String(req.body?.plan || 'pro')] || PLANOS.pro;
+  const sid = crypto.randomBytes(16).toString('hex');
+  try {
+    await dbRun('INSERT INTO checkouts (sid, userId, plan, amountCents, createdAt) VALUES (?,?,?,?,?)',
+      sid, userId, 'pro', plano.amountCents, Date.now());
+    const host = `${req.protocol}://${req.get('host')}`;
+    log(`[CHECKOUT] criado sid=${sid} user=${userId} plan=pro`);
+    res.json({ ok: true, sid, url: `${host}/checkout/${sid}` });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+async function markCheckoutPaid(sid, origem) {
+  const c = await dbGet('SELECT * FROM checkouts WHERE sid = ?', sid);
+  if (!c) return null;
+  if (c.status !== 'paid') {
+    await dbRun("UPDATE checkouts SET status='paid', paidAt=? WHERE sid=?", Date.now(), sid);
+    await dbRun("UPDATE accounts SET plan='pro' WHERE userId=?", c.userId);
+    log(`[CHECKOUT] pago sid=${sid} user=${c.userId} via ${origem}`);
+  }
+  return c;
+}
+
+/** Confirmação de DEV (env CHECKOUT_DEV_CONFIRM=1) — até o gateway real entrar. */
+app.post('/api/checkout/:sid/confirm', async (req, res) => {
+  if (!DEV_CONFIRM) return res.status(403).json({ ok: false, error: 'DEV_CONFIRM_DESLIGADO' });
+  const c = await markCheckoutPaid(req.params.sid, 'dev_confirm');
+  if (!c) return res.status(404).json({ ok: false, error: 'SID_INVALIDO' });
+  res.json({ ok: true, status: 'paid' });
+});
+
+/** Webhook do gateway real (Mercado Pago/Stripe): validar e marcar pago. */
+app.post('/api/pay/webhook', async (req, res) => {
+  const secret = process.env.PAY_WEBHOOK_SECRET || '';
+  if (secret && req.header('x-webhook-secret') !== secret) {
+    return res.status(401).json({ ok: false });
+  }
+  const sid = String(req.body?.sid || req.body?.external_reference || '');
+  if (!sid) return res.status(400).json({ ok: false, error: 'SID_AUSENTE' });
+  const c = await markCheckoutPaid(sid, 'webhook');
+  res.json({ ok: Boolean(c) });
+});
+
+/** App faz polling depois que o usuário volta do navegador. */
+app.get('/api/checkout/:sid/status', authHttp, async (req, res) => {
+  const c = await dbGet('SELECT status, plan FROM checkouts WHERE sid = ?', req.params.sid).catch(() => null);
+  if (!c) return res.status(404).json({ ok: false, error: 'SID_INVALIDO' });
+  res.json({ ok: true, status: c.status, plan: c.plan });
+});
+
+/** Página pública de pagamento — o sid na URL é o segredo. */
+app.get('/checkout/:sid', async (req, res) => {
+  const c = await dbGet('SELECT * FROM checkouts WHERE sid = ?', req.params.sid).catch(() => null);
+  res.type('html');
+  if (!c) return res.status(404).send('<h2>Sessão inválida ou expirada.</h2>');
+  const plano = PLANOS[c.plan] || PLANOS.pro;
+  const preco = (c.amountCents / 100).toFixed(2).replace('.', ',');
+  const pago = c.status === 'paid';
+  const payBtn = CHECKOUT_GATEWAY_URL
+    ? `<a class="btn" href="${CHECKOUT_GATEWAY_URL.replace(/"/g, '&quot;')}">PAGAR R$ ${preco}</a>
+       <p class="hint">Você será levado ao checkout seguro do parceiro de pagamento.</p>`
+    : DEV_CONFIRM
+      ? `<button class="btn" onclick="fetch('/api/checkout/${c.sid}/confirm',{method:'POST'}).then(r=>r.json()).then(d=>{if(d.ok)location.reload()})">PAGAR R$ ${preco} (modo teste)</button>
+         <p class="hint">Gateway ainda não configurado — confirmação de teste.</p>`
+      : `<p class="hint">Gateway de pagamento ainda não configurado. Fale com o suporte.</p>`;
+  res.send(`<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ubika — Checkout</title>
+<style>
+  body{margin:0;background:#0d0418;color:#fff;font-family:system-ui,sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh}
+  .card{background:#140822;border:1px solid #673AB7;border-radius:16px;padding:32px;max-width:380px;text-align:center}
+  h1{color:#B39DDB;font-size:20px;letter-spacing:2px;margin:0 0 4px}
+  .price{font-size:34px;font-weight:800;margin:14px 0}
+  .btn{display:inline-block;background:#673AB7;color:#fff;border:0;border-radius:10px;padding:14px 28px;font-size:16px;font-weight:700;cursor:pointer;text-decoration:none;margin-top:8px}
+  .hint{color:#8a7fa8;font-size:12px;margin-top:14px}
+  .ok{color:#66BB6A;font-size:22px;font-weight:800}
+</style></head><body><div class="card">
+<h1>UBIKA</h1>
+${pago
+  ? '<p class="ok">✓ Pagamento confirmado!</p><p>Seu plano PRO está ativo.<br>Volte ao app.</p>'
+  : `<p style="color:#8a7fa8">${plano.descricao}</p>
+     <p style="font-size:18px;font-weight:700">${plano.nome}</p>
+     <p class="price">R$ ${preco}<span style="font-size:14px;color:#8a7fa8">/mês</span></p>
+     ${payBtn}
+     <script>setInterval(()=>fetch('/api/checkout/${c.sid}/status').then(r=>r.json()).then(d=>{if(d.status==='paid')location.reload()}),4000)</script>`}
+</div></body></html>`);
 });
 
 app.post('/api/pay', authHttp, (req, res) => {

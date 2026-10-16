@@ -7,3 +7,4 @@ UbikaPc/PAREAR.txt
 *.tmp
 *.log
 UbikaPc/state.json
+server/test_*.db
