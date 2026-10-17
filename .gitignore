@@ -8,3 +8,4 @@ UbikaPc/PAREAR.txt
 *.log
 UbikaPc/state.json
 server/test_*.db
+AGENTS.md
