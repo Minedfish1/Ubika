@@ -1,4 +1,4 @@
-# install-vdd.ps1 — instala o Virtual Display Driver (MTT VDD) vendored em UbikaPc\driver.
+﻿# install-vdd.ps1 — instala o Virtual Display Driver (MTT VDD) vendored em UbikaPc\driver.
 # Precisa rodar elevado (o launcher chama com Start-Process -Verb RunAs → prompt UAC).
 param(
     [string]$Source = (Join-Path (Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)) 'driver'),

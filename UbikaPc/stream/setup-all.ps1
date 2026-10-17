@@ -1,4 +1,4 @@
-# setup-all.ps1 — setup completo num prompt UAC só:
+﻿# setup-all.ps1 — setup completo num prompt UAC só:
 # 1) instala Sunshine (winget; fallback: instalador do GitHub, silencioso)
 # 2) instala o VDD vendored (chama install-vdd.ps1)
 # Rode elevado. Log: %ProgramData%\Ubika\setup-all.log
