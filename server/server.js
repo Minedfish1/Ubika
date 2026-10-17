@@ -606,6 +606,13 @@ io.on('connection', (socket) => {
     socket.to(`user:${userId}`).emit('download_progress', { ...data, userId });
   });
 
+  // PC -> celular: controle plugou/desplugou (handoff GameSir)
+  socket.on('controller_event', (data) => {
+    const userId = socket.data.userId || data?.userId;
+    if (!userId) return;
+    socket.to(`user:${userId}`).emit('controller_event', { ...data, userId });
+  });
+
   // App -> VPS -> PC : encaminha comando e devolve o ack do PC ao app
   socket.on('send_to_pc', (data, ack) => {
     const reply = typeof ack === 'function' ? ack : () => {};

@@ -114,7 +114,13 @@ class DownloadManager {
     this._emitUpdate(entry);
   }
 
-  /** Cada jogo baixa na própria pasta: C:\UbikaGames\<Nome do Jogo>\... */
+  /** Troca a pasta raiz dos jogos em runtime (downloads novos passam a usá-la). */
+  setSavePath(dir) {
+    this.savePath = dir;
+    try { fs.mkdirSync(dir, { recursive: true }); } catch {}
+  }
+
+  /** Cada jogo baixa na própria pasta: <games>\<Nome do Jogo>\... */
   _gameDir(gameName) {
     const clean = String(gameName || 'download')
       .replace(/[\\/:*?"<>|]/g, ' ').replace(/\s{2,}/g, ' ').trim().slice(0, 80)
@@ -606,11 +612,18 @@ function extractInfoHash(magnet) {
   }
 }
 
+/**
+ * Pasta dos jogos: UBIKA_DOWNLOAD_DIR (env/settings) > <BASE_DIR>\games.
+ * Padrão fica dentro da própria pasta Ubika (%LOCALAPPDATA%\Ubika\games no exe).
+ */
 function defaultDownloadDir() {
-  return process.env.UBIKA_DOWNLOAD_DIR
+  const env = (process.env.UBIKA_DOWNLOAD_DIR || '').trim();
+  if (env) return env;
+  const base = process.env.UBIKA_BASE_DIR
     || (process.platform === 'win32'
-      ? 'C:\\UbikaGames'
-      : path.join(os.homedir(), 'UbikaGames'));
+      ? path.join(process.env.LOCALAPPDATA || os.homedir(), 'Ubika')
+      : path.join(os.homedir(), '.ubika'));
+  return path.join(base, 'games');
 }
 
 module.exports = { DownloadManager, defaultDownloadDir };

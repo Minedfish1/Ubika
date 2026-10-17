@@ -9,7 +9,6 @@ mkdir build 2>nul
 (
   echo UBIKA_SERVER=http://18.223.108.137:3000
   findstr /b "UBIKA_SHARED_SECRET=" .env
-  echo UBIKA_DOWNLOAD_DIR=C:\UbikaGames
   echo UBIKA_SYNC_INTERVAL_MS=21600000
 ) > build\default.env
 

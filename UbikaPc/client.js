@@ -71,16 +71,20 @@ let pairCodeExpiresAt = Date.now() + PAIR_ROTATE_MS;
 
 const log = (...args) => console.log(new Date().toISOString(), ...args);
 
-function saveUserIdToEnv(userId) {
+function saveEnvVar(key, value) {
   try {
     let env = fs.existsSync(ENV_PATH) ? fs.readFileSync(ENV_PATH, 'utf8') : '';
-    if (/^UBIKA_USER_ID=.*$/m.test(env)) env = env.replace(/^UBIKA_USER_ID=.*$/m, `UBIKA_USER_ID=${userId}`);
-    else env += `\nUBIKA_USER_ID=${userId}`;
+    const re = new RegExp(`^${key}=.*$`, 'm');
+    if (re.test(env)) env = env.replace(re, `${key}=${value}`);
+    else env += (env.endsWith('\n') || !env ? '' : '\n') + `${key}=${value}\n`;
     fs.writeFileSync(ENV_PATH, env);
+    return true;
   } catch (err) {
-    log(`[PAIR] não consegui gravar .env: ${err.message}`);
+    log(`[ENV] não consegui gravar ${key}: ${err.message}`);
+    return false;
   }
 }
+function saveUserIdToEnv(userId) { saveEnvVar('UBIKA_USER_ID', userId); }
 
 /** Primeiro IPv4 privado (RFC1918); senão qualquer não-interno. lanIp só interessa na mesma rede. */
 function detectBestIp() {
@@ -167,11 +171,34 @@ function restoreDisplay(origem) {
 }
 
 // ---------- Downloads ----------
-const downloadDir = defaultDownloadDir();
+let downloadDir = defaultDownloadDir();
 const downloads = new DownloadManager(downloadDir, (snap) => {
   if (socket.connected && USER_ID) socket.emit('download_progress', { userId: USER_ID, ...snap });
 });
 downloads.init().then(() => downloads.start());
+
+// ---------- Handoff GameSir: plug/desplug do controle ----------
+// A cada 4s conta gamepads PnP (BT ou USB). Desconectou → o celular
+// assume instantaneamente (app navega pro Stream / retoma o jogo).
+let lastPadCount = -1;
+function pollGamepads() {
+  require('child_process').exec(
+    'powershell -NoProfile -Command "(Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | Where-Object { $_.FriendlyName -match \'game controller|gamepad|xbox|dualsense|dualshock|gamesir|wireless controller\' }).Count"',
+    { timeout: 20000, windowsHide: true },
+    (err, out) => {
+      if (err) return;
+      const n = parseInt(String(out).trim(), 10);
+      if (!Number.isFinite(n)) return;
+      if (lastPadCount >= 0 && n !== lastPadCount && socket.connected && USER_ID) {
+        const type = n < lastPadCount ? 'unplugged' : 'plugged';
+        log(`[PAD] controle ${type} (${lastPadCount}->${n})`);
+        socket.emit('controller_event', { userId: USER_ID, type, count: n });
+      }
+      lastPadCount = n;
+    }
+  );
+}
+if (process.platform === 'win32') setInterval(pollGamepads, 4000);
 
 // ---------- Comandos ----------
 function validateInstallPath(input) {
@@ -412,8 +439,11 @@ try {
   const lock = require('net').createServer();
   lock.on('error', (e) => {
     if (e.code === 'EADDRINUSE') {
-      console.log('[UBIKA] Outra instância do daemon já está rodando — saindo.');
-      process.exit(0);
+      console.log('[UBIKA] Já está rodando em segundo plano — abrindo o painel…');
+      try {
+        require('child_process').exec('cmd /c start "" "http://127.0.0.1:47890"', { windowsHide: true });
+      } catch {}
+      setTimeout(() => process.exit(0), 1500);
     }
   });
   lock.listen(47891, '127.0.0.1');
@@ -479,28 +509,83 @@ async function speedTest() {
 
 log(`🟢 Ubika PC Daemon ativo user=${USER_ID || '(aguardando pareamento)'} device=${DEVICE_ID} lanIp=${LAN_IP || 'n/a'} ipv6=${PUBLIC_V6 || 'n/a'} engine=${downloads.engineName} dir=${downloadDir}`);
 
-// ---------- GUI local: código de pareamento + status ----------
+// ---------- GUI local: conta + pareamento + status + configurações ----------
+
+/** Login/registro via painel local → VPS /api/auth → adota o userId retornado. */
+async function guiAuth(mode, email, password) {
+  if (!/^\S+@\S+\.\S+$/.test(email)) return { ok: false, error: 'EMAIL_INVALIDO' };
+  if (password.length < 6) return { ok: false, error: 'SENHA_CURTA_MIN_6' };
+  try {
+    const axios = require('axios');
+    const r = await axios.post(`${SERVER_URL}/api/auth/${mode === 'register' ? 'register' : 'login'}`,
+      { email, password }, { timeout: 15000 });
+    const d = r.data || {};
+    if (!d.ok || !d.userId) return { ok: false, error: d.error || 'AUTH_FAILED' };
+    USER_ID = d.userId;
+    process.env.UBIKA_USER_ID = USER_ID;
+    saveUserIdToEnv(USER_ID);
+    state.account = { userId: USER_ID, email: d.email || email, plan: d.plan || '' };
+    saveState();
+    announcePc();
+    log(`[AUTH] ${mode} ok → user=${USER_ID}`);
+    return { ok: true, email: d.email, plan: d.plan };
+  } catch (err) {
+    const code = err.response?.data?.error || err.message;
+    return { ok: false, error: code };
+  }
+}
+
+function guiLogout() {
+  USER_ID = '';
+  process.env.UBIKA_USER_ID = '';
+  state.account = null;
+  saveState();
+  saveEnvVar('UBIKA_USER_ID', '');
+  announcePc(); // re-registra sem userId → volta ao modo pareamento
+  log('[AUTH] logout — PC voltou ao modo pareamento');
+  return { ok: true };
+}
+
+function guiSettings(body) {
+  const dir = String(body?.downloadDir || '').trim();
+  if (!dir || !path.isAbsolute(dir)) return { ok: false, error: 'Caminho inválido — use caminho absoluto (ex.: C:\\Ubika\\games)' };
+  try { fs.mkdirSync(dir, { recursive: true }); } catch (e) { return { ok: false, error: `Não consegui criar: ${e.message}` }; }
+  downloadDir = dir;
+  downloads.setSavePath(dir);
+  saveEnvVar('UBIKA_DOWNLOAD_DIR', dir);
+  log(`[CFG] pasta dos jogos → ${dir}`);
+  return { ok: true, downloadDir };
+}
+
 try {
   const { startGui } = require('./gui');
-  startGui(Number(process.env.UBIKA_GUI_PORT) || 47890, () => {
-    const st = sunshine.streamStatus();
-    return {
-      paired: Boolean(USER_ID),
-      pairCode,
-      pairCodeTtlSec: Math.max(0, Math.round((pairCodeExpiresAt - Date.now()) / 1000)),
-      userId: USER_ID,
-      deviceId: DEVICE_ID,
-      lanIp: LAN_IP,
-      publicIp: PUBLIC_IP,
-      online: socket.connected,
-      sunshineInstalled: st.sunshineInstalled,
-      sunshineRunning: st.sunshineRunning,
-      vddInstalled: st.vddInstalled,
-      librarySize: searchLibrary('', 1).total,
-      downloads: downloads.list().slice(-5),
-      uptime: Math.floor(process.uptime()),
-    };
-  }, speedTest);
+  startGui(Number(process.env.UBIKA_GUI_PORT) || 47890, {
+    getState: () => {
+      const st = sunshine.streamStatus();
+      return {
+        paired: Boolean(USER_ID),
+        account: state.account || (USER_ID ? { userId: USER_ID } : null),
+        pairCode,
+        pairCodeTtlSec: Math.max(0, Math.round((pairCodeExpiresAt - Date.now()) / 1000)),
+        userId: USER_ID,
+        deviceId: DEVICE_ID,
+        lanIp: LAN_IP,
+        publicIp: PUBLIC_IP,
+        online: socket.connected,
+        sunshineInstalled: st.sunshineInstalled,
+        sunshineRunning: st.sunshineRunning,
+        vddInstalled: st.vddInstalled,
+        librarySize: searchLibrary('', 1).total,
+        downloads: downloads.list().slice(-5),
+        downloadDir,
+        uptime: Math.floor(process.uptime()),
+      };
+    },
+    onSpeedTest: speedTest,
+    onAuth: guiAuth,
+    onLogout: guiLogout,
+    onSettings: guiSettings,
+  });
 } catch (err) {
   log(`[GUI] não subiu: ${err.message}`);
 }
