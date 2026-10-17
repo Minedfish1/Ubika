@@ -148,22 +148,31 @@ function searchLibrary(search, page) {
   const term = normalizarTexto(search);
   const filtered = term ? biblioteca.filter(g => matches(g, term)) : biblioteca;
 
-  // Agrupa por obra: um jogo presente em várias fontes vira um card com várias versões
+  // Agrupa por obra: um jogo presente em várias fontes vira um card com várias versões.
+  // Por fonte fica SÓ a mais recente — fitgirl v1.1 esconde fitgirl v1.0.
   const groups = new Map();
   for (const g of filtered) {
     const key = groupKey(g.titleNorm) || g.titleNorm;
     let grp = groups.get(key);
-    if (!grp) { grp = { rep: g, versions: [] }; groups.set(key, grp); }
-    grp.versions.push({
-      source: g.source,
-      size: g.size,
-      magnet: g.magnet,
-      links: g.directLinks,
-      installId: g.installId,
-      downloadAvailable: g.downloadAvailable,
-    });
+    if (!grp) { grp = { rep: g, bySource: new Map() }; groups.set(key, grp); }
+    const prev = grp.bySource.get(g.source);
+    if (!prev || String(g.date) > String(prev.date)) {
+      grp.bySource.set(g.source, {
+        source: g.source,
+        size: g.size,
+        magnet: g.magnet,
+        links: g.directLinks,
+        installId: g.installId,
+        downloadAvailable: g.downloadAvailable,
+        date: g.date,
+      });
+    }
     // representante = entrada mais recente do grupo
     if (String(g.date) > String(grp.rep.date)) grp.rep = g;
+  }
+  // achata bySource → versions (mais recente de cada fonte, ordenado por data desc)
+  for (const grp of groups.values()) {
+    grp.versions = [...grp.bySource.values()].sort((a, b) => String(b.date).localeCompare(String(a.date)));
   }
   const ordered = [...groups.values()].sort((a, b) =>
     String(b.rep.date).localeCompare(String(a.rep.date)) || a.rep.title.localeCompare(b.rep.title));
@@ -171,12 +180,13 @@ function searchLibrary(search, page) {
   const start = (page - 1) * PAGE_SIZE;
   const end = page * PAGE_SIZE;
   const games = ordered.slice(start, end).map(({ rep: g, versions }, i) => ({
+    // eslint-disable-next-line no-unused-vars
     id: g.id || `${page}-${i}`,
     title: g.title,
     coverUrl: g.coverUrl || FALLBACK_COVER,
     description: g.description || 'Sem descrição disponível.',
     installed: g.installed,
-    versions,
+    versions: versions.map(({ date, ...v }) => v), // tira o campo auxiliar
   }));
   return { games, isLastPage: end >= ordered.length, total: ordered.length };
 }
