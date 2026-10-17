@@ -50,6 +50,39 @@ function decodeEntities(s) {
     .replace(/&gt;/g, '>');
 }
 
+/**
+ * Título de exibição limpo: "Terraria Free Download [1.4.5.8 / build-248…]"
+ * → "Terraria". Remove sufixos de release/versão/DLC que poluem o card.
+ */
+function cleanTitle(raw) {
+  let t = String(raw || '');
+  t = t.replace(/\[[^\]]*\]/g, ' ');                                    // [v1.4.5.8 / build-…]
+  t = t.replace(/\{[^}]*\}/g, ' ');
+  // parênteses que só trazem metadados de release: (Release), (v1.2), (7 DLCs)…
+  t = t.replace(/\((?:[^()]*\b(?:release|repack|dlcs?|multi\d+|update|hotfix|build|version|v\d|goty|edition|pack)\b[^()]*)\)/gi, ' ');
+  t = t.replace(/\bfree\s*download\b/gi, ' ');
+  t = t.replace(/\bfull\s*(?:game|version)\b/gi, ' ');
+  t = t.replace(/\+\s*\d+\s*dlcs?\b/gi, ' ');
+  t = t.replace(/\ball\s*dlcs?\b/gi, ' ');
+  t = t.replace(/[\-–—._]\s*(?:repack|gog|dodi|fitgirl|xatab|empress|codex|flt|skidrow)\b/gi, ' ');
+  t = t.replace(/\bbuild[-\s.]?\d{3,}\b/gi, ' ');
+  t = t.replace(/\bv?\d+\.\d+(?:\.\d+)+\b/g, ' ');                       // 1.4.5.8
+  t = t.replace(/[\-–—]\s*v?\d[\d.\s]*$/gi, ' ');                        // "– v4894958" no fim
+  t = t.replace(/[\s._\-–—:]{2,}/g, ' ');
+  t = t.replace(/^[\s._\-–—:+]+|[\s._\-–—:+]+$/g, '');
+  return t || String(raw || '').trim();
+}
+
+/** Manifesto de instalações locais (escrito ao fim de cada download). */
+function loadInstalls() {
+  try {
+    const file = path.join(DIR_LIBRARY, 'installs.json');
+    if (!fs.existsSync(file)) return [];
+    const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return Array.isArray(data) ? data : [];
+  } catch { return []; }
+}
+
 /** Nome do jogo via dn= do magnet quando o item não traz title. */
 function titleFromMagnet(magnet) {
   const m = /[?&]dn=([^&]*)/i.exec(String(magnet || ''));
@@ -84,6 +117,7 @@ function loadLibrary() {
         // Fallback: sem title explícito, extrai o nome do parâmetro dn= do magnet
         let title = String(item?.title || item?.name || '').replace(/\./g, ' ').trim();
         if (!title) title = titleFromMagnet(magnet).trim();
+        title = cleanTitle(title);
         if (!title) continue;
 
         next.push({
@@ -174,20 +208,32 @@ function searchLibrary(search, page) {
   for (const grp of groups.values()) {
     grp.versions = [...grp.bySource.values()].sort((a, b) => String(b.date).localeCompare(String(a.date)));
   }
-  const ordered = [...groups.values()].sort((a, b) =>
-    String(b.rep.date).localeCompare(String(a.rep.date)) || a.rep.title.localeCompare(b.rep.title));
+  const ordered = [...groups.entries()].sort((a, b) =>
+    String(b[1].rep.date).localeCompare(String(a[1].rep.date)) || a[1].rep.title.localeCompare(b[1].rep.title));
+
+  // Instalados locais: casa pelo groupKey do título limpo (Terraria Free Download [v…] == Terraria)
+  const installsByKey = new Map();
+  for (const inst of loadInstalls()) {
+    const k = groupKey(normalizarTexto(cleanTitle(inst.title))) || normalizarTexto(cleanTitle(inst.title));
+    if (k && !installsByKey.has(k)) installsByKey.set(k, inst);
+  }
 
   const start = (page - 1) * PAGE_SIZE;
   const end = page * PAGE_SIZE;
-  const games = ordered.slice(start, end).map(({ rep: g, versions }, i) => ({
-    // eslint-disable-next-line no-unused-vars
-    id: g.id || `${page}-${i}`,
-    title: g.title,
-    coverUrl: g.coverUrl || FALLBACK_COVER,
-    description: g.description || 'Sem descrição disponível.',
-    installed: g.installed,
-    versions: versions.map(({ date, ...v }) => v), // tira o campo auxiliar
-  }));
+  const games = ordered.slice(start, end).map(([key, { rep: g, versions }], i) => {
+    const inst = installsByKey.get(key);
+    return {
+      // eslint-disable-next-line no-unused-vars
+      id: g.id || `${page}-${i}`,
+      title: g.title,
+      coverUrl: g.coverUrl || FALLBACK_COVER,
+      description: g.description || 'Sem descrição disponível.',
+      installed: g.installed || Boolean(inst),
+      installId: g.installId || inst?.installId || null,
+      playable: Boolean(inst?.playable),
+      versions: versions.map(({ date, ...v }) => v), // tira o campo auxiliar
+    };
+  });
   return { games, isLastPage: end >= ordered.length, total: ordered.length };
 }
 
@@ -246,4 +292,4 @@ function watchLibrary() {
   }
 }
 
-module.exports = { DIR_LIBRARY, loadLibrary, scheduleReload, searchLibrary, syncSources, watchLibrary };
+module.exports = { DIR_LIBRARY, cleanTitle, loadInstalls, loadLibrary, scheduleReload, searchLibrary, syncSources, watchLibrary };

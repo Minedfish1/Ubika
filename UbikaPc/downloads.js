@@ -19,9 +19,10 @@ const SETUP_SIDECAR_RE = /^(setup[-_.]?\d*|install[-_.]?\d*)\.(bin|dat|cab|sfx)$
  * expor os mesmos métodos.
  */
 class DownloadManager {
-  constructor(savePath, onUpdate) {
+  constructor(savePath, onUpdate, onReady) {
     this.savePath = savePath;
     this.onUpdate = onUpdate || (() => {});
+    this.onReady = onReady || (() => {});
     this.downloads = new Map(); // id -> entry (webtorrent + http)
     this.client = null;         // webtorrent
     this.qb = null;             // qbittorrent backend (libtorrent real)
@@ -409,6 +410,7 @@ class DownloadManager {
       const { archives, archiveVolumes, setups } = this._scanInstallables(dir);
       if (!archives.length && !setups.length) {
         this._setState(entry, 'ready');
+        try { this.onReady(entry, dir); } catch {}
         return;
       }
 
@@ -455,6 +457,7 @@ class DownloadManager {
 
       entry.installProgress = 100;
       this._setState(entry, 'ready');
+      try { this.onReady(entry, dir); } catch {}
     } catch (err) {
       log(`[INSTALL] erro pós-download: ${err.message}`);
       this._setState(entry, 'install_error', err);

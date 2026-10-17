@@ -10,7 +10,7 @@ const BASE_DIR = process.env.UBIKA_BASE_DIR || __dirname;
 // Carrega .env ao lado do script (Node >=20.12); ignora se não existir
 try { process.loadEnvFile(path.join(BASE_DIR, '.env')); } catch {}
 
-const { loadLibrary, searchLibrary, syncSources, watchLibrary, DIR_LIBRARY } = require('./library');
+const { loadLibrary, searchLibrary, syncSources, watchLibrary, DIR_LIBRARY, cleanTitle, loadInstalls } = require('./library');
 const { DownloadManager, defaultDownloadDir } = require('./downloads');
 const sunshine = require('./sunshine');
 
@@ -174,8 +174,115 @@ function restoreDisplay(origem) {
 let downloadDir = defaultDownloadDir();
 const downloads = new DownloadManager(downloadDir, (snap) => {
   if (socket.connected && USER_ID) socket.emit('download_progress', { userId: USER_ID, ...snap });
-});
+}, onGameReady);
 downloads.init().then(() => downloads.start());
+
+// ---------- Registro de jogos instalados (library/installs.json) ----------
+// Quando um download fica 'ready', grava manifesto { installId, title, dir,
+// executable }. O searchLibrary casa pelo título → app mostra só JOGAR.
+
+const EXE_SKIP_RE = /setup|install|unins|uninst|redist|vcredist|vc_redist|dxweb|dotnet|easy.?anti|battl?eye|crash|report|helper|service|update|patch|launcher|7z|unrar|config|editor|server|benchmark|tool/i;
+
+/** Tamanho da pasta em bytes (rápido o suficiente p/ ~mil arquivos). */
+function dirSize(dir) {
+  let total = 0;
+  const walk = (d, depth) => {
+    if (depth > 6 || total > 400e9) return;
+    let ents;
+    try { ents = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const e of ents) {
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) walk(p, depth + 1);
+      else { try { total += fs.statSync(p).size; } catch {} }
+    }
+  };
+  walk(dir, 0);
+  return total;
+}
+
+/** Acha o .exe principal do jogo — pula instaladores/ferramentas, prefere o maior. */
+function findGameExe(dir) {
+  let best = null;
+  const walk = (d, depth) => {
+    if (depth > 4) return;
+    let ents;
+    try { ents = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const e of ents) {
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) { walk(p, depth + 1); continue; }
+      if (!/\.exe$/i.test(e.name) || EXE_SKIP_RE.test(e.name)) continue;
+      let size = 0;
+      try { size = fs.statSync(p).size; } catch {}
+      if (!best || size > best.size) best = { path: p, size };
+    }
+  };
+  walk(dir, 0);
+  return best?.path || null;
+}
+
+function upsertInstall(rec) {
+  const file = path.join(DIR_LIBRARY, 'installs.json');
+  fs.mkdirSync(DIR_LIBRARY, { recursive: true });
+  let list = loadInstalls();
+  const i = list.findIndex(x => x.installId === rec.installId || x.dir === rec.dir);
+  if (i >= 0) list[i] = { ...list[i], ...rec };
+  else list.push(rec);
+  fs.writeFileSync(file, JSON.stringify(list, null, 2));
+}
+
+/** Download ficou 'ready' → registra instalação + reindexa biblioteca. */
+function onGameReady(entry, dir) {
+  try {
+    const exe = findGameExe(dir);
+    upsertInstall({
+      installId: entry.id || crypto.randomUUID(),
+      title: cleanTitle(entry.gameName),
+      dir,
+      executable: exe,
+      workingDirectory: exe ? path.dirname(exe) : dir,
+      playable: Boolean(exe),
+      installed: true,
+      source: 'download',
+      date: new Date().toISOString(),
+    });
+    loadLibrary();
+    log(`[INSTALL] registrado: ${entry.gameName}${exe ? '' : ' (sem executável achado)'}`);
+  } catch (err) {
+    log(`[INSTALL] registro falhou: ${err.message}`);
+  }
+}
+
+/** Pastas de jogos que já existiam antes do recurso de registro → reconcilia no boot. */
+function reconcileInstalls() {
+  try {
+    if (!fs.existsSync(downloadDir)) return;
+    const known = new Set(loadInstalls().map(x => x.dir));
+    let added = 0;
+    for (const e of fs.readdirSync(downloadDir, { withFileTypes: true })) {
+      if (!e.isDirectory() || e.name.startsWith('.')) continue;
+      const dir = path.join(downloadDir, e.name);
+      if (known.has(dir)) continue;
+      const exe = findGameExe(dir);
+      if (!exe) continue; // pasta sem jogo jogável (só arquivos/Downloads)
+      upsertInstall({
+        installId: crypto.randomUUID(),
+        title: cleanTitle(e.name),
+        dir,
+        executable: exe,
+        workingDirectory: path.dirname(exe),
+        playable: true,
+        installed: true,
+        source: 'existing',
+        date: new Date().toISOString(),
+      });
+      added++;
+    }
+    if (added) { loadLibrary(); log(`[INSTALL] reconciliados ${added} jogo(s) já existentes`); }
+  } catch (err) {
+    log(`[INSTALL] reconcile falhou: ${err.message}`);
+  }
+}
+setTimeout(reconcileInstalls, 5000);
 
 // ---------- Handoff GameSir: plug/desplug do controle ----------
 // A cada 4s conta gamepads PnP (BT ou USB). Desconectou → o celular
@@ -271,6 +378,54 @@ async function executeCommand(payload, ack) {
       case 'listar_downloads':
         return ack({ ok: true, downloads: downloads.list() });
 
+      // Jogos instalados (manifesto local) — alimenta a aba Biblioteca
+      case 'listar_instalados':
+        return ack({
+          ok: true,
+          games: loadInstalls().map(i => ({
+            installId: i.installId,
+            name: i.title,
+            dir: i.dir,
+            playable: Boolean(i.playable),
+            executable: i.executable || null,
+            settings: i.settings || null,
+            sizeBytes: dirSize(i.dir),
+          })),
+        });
+
+      // Config por jogo: resolução/fps/bitrate próprios (aplicados no launch)
+      case 'config_jogo': {
+        const installId = String(payload.installId || '');
+        const s = payload.settings || {};
+        const list = loadInstalls();
+        const rec = list.find(x => String(x.installId) === installId);
+        if (!rec) return ack({ ok: false, error: 'NOT_FOUND' });
+        rec.settings = {
+          width: +s.width || 0, height: +s.height || 0,
+          fps: +s.fps || 0, bitrate: +s.bitrate || 0,
+        };
+        fs.writeFileSync(path.join(DIR_LIBRARY, 'installs.json'), JSON.stringify(list, null, 2));
+        log(`[CFG] ${rec.title}: ${JSON.stringify(rec.settings)}`);
+        return ack({ ok: true, settings: rec.settings });
+      }
+
+      // Apagar jogo: pasta + manifesto + entrada na lista de downloads
+      case 'excluir_jogo': {
+        const installId = String(payload.installId || '');
+        const list = loadInstalls();
+        const rec = list.find(x => String(x.installId) === installId);
+        if (!rec) return ack({ ok: false, error: 'NOT_FOUND' });
+        try { if (rec.dir && fs.existsSync(rec.dir)) fs.rmSync(rec.dir, { recursive: true, force: true }); } catch (e) {
+          log(`[INSTALL] apagar pasta falhou: ${e.message}`);
+        }
+        fs.writeFileSync(path.join(DIR_LIBRARY, 'installs.json'),
+          JSON.stringify(list.filter(x => String(x.installId) !== installId), null, 2));
+        downloads.remove(installId, false);
+        loadLibrary();
+        log(`[INSTALL] apagado: ${rec.title}`);
+        return ack({ ok: true });
+      }
+
       case 'pausar_download':
         return ack(downloads.pause(String(payload.id || '')));
 
@@ -301,9 +456,10 @@ async function executeCommand(payload, ack) {
         const manifest = validateInstallPath(payload);
         if (!manifest?.executable) return ack({ ok: false, error: 'INSTALL_MANIFEST_NOT_FOUND' });
 
-        // Abriu jogo → ajusta o display pra resolução do celular (se já anunciada
-        // ou enviada junto no payload). Sunshine repete no stream-start via prep_cmd.
-        const resToApply = (payload?.width && payload?.height) ? payload : state.clientRes;
+        // Abriu jogo → resolução: payload > config do jogo > resolução do celular.
+        // Sunshine repete no stream-start via prep_cmd.
+        const resToApply = (payload?.width && payload?.height) ? payload
+          : (manifest.settings?.width ? manifest.settings : state.clientRes);
         if (resToApply?.width) applyClientResolution(resToApply, { attach: true });
 
         // Somente executáveis explicitamente registrados no manifesto local do usuário.
