@@ -31,6 +31,7 @@ const SEA_ASSETS = [
   'default.env',
   'stream/display-attach.ps1', 'stream/display-detach.ps1', 'stream/install-vdd.ps1', 'stream/setup-all.ps1',
   'driver/MttVDD.dll', 'driver/MttVDD.inf', 'driver/Virtual_Display_Driver.cer', 'driver/mttvdd.cat', 'driver/vdd_settings.xml',
+  'tools/7za.exe', 'tools/7za.dll',
   'library/dodi.json', 'library/empress.json', 'library/fitgirl.json', 'library/gog.json',
   'library/onlinefix.json', 'library/steamgg.json', 'library/xatab.json',
 ];

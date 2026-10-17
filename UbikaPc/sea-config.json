@@ -16,6 +16,8 @@
     "driver/Virtual_Display_Driver.cer": "driver/Virtual_Display_Driver.cer",
     "driver/mttvdd.cat": "driver/mttvdd.cat",
     "driver/vdd_settings.xml": "driver/vdd_settings.xml",
+    "tools/7za.exe": "tools/7za.exe",
+    "tools/7za.dll": "tools/7za.dll",
     "library/dodi.json": "library/dodi.json",
     "library/empress.json": "library/empress.json",
     "library/fitgirl.json": "library/fitgirl.json",

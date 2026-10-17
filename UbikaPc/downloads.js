@@ -1,8 +1,14 @@
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const { spawn } = require('child_process');
 
 const log = (...args) => console.log(new Date().toISOString(), ...args);
+
+const ARCHIVE_RE = /\.(zip|rar|7z|001|iso|tar|gz)$/i;
+const RAR_PART_RE = /\.r(\d+)$/i;              // volume rar de continuação (não é entry point)
+const SETUP_RE = /setup|install|\.sfx\.exe$/i;
+const SETUP_SIDECAR_RE = /^(setup[-_.]?\d*|install[-_.]?\d*)\.(bin|dat|cab|sfx)$/i;
 
 /**
  * DownloadManager — motor de torrents do daemon.
@@ -67,7 +73,7 @@ class DownloadManager {
     // Snapshot de progresso a cada 2s para o app
     this._tick = setInterval(() => {
       for (const entry of this.downloads.values()) {
-        if (entry.state === 'downloading' || entry.state === 'fetching-metadata') {
+        if (entry.state === 'downloading' || entry.state === 'fetching-metadata' || entry.state === 'installing') {
           this._emitUpdate(entry);
         }
       }
@@ -94,6 +100,7 @@ class DownloadManager {
       finishedAt: entry.finishedAt || null,
       error: entry.error || null,
       engine: this.engineName,
+      installProgress: entry.state === 'installing' ? (entry.installProgress ?? -1) : null,
     };
   }
 
@@ -181,7 +188,8 @@ class DownloadManager {
     torrent.on('done', () => {
       log(`[DL] concluído: ${torrent.name}`);
       entry.finishedAt = new Date().toISOString();
-      this._setState(entry, 'done'); // o app filtra instalados por state==='done'
+      this._setState(entry, 'done');
+      this._postDownload(entry);
     });
     torrent.on('error', err => {
       log(`[DL] erro em ${entry.gameName}: ${err.message}`);
@@ -247,6 +255,9 @@ class DownloadManager {
         if (st === 'done' && !entry.finishedAt) {
           entry.finishedAt = t.completion_on > 0 ? new Date(t.completion_on * 1000).toISOString() : new Date().toISOString();
           log(`[DL] concluído (qb): ${entry.gameName}`);
+          this._setState(entry, st);
+          this._postDownload(entry);
+          continue;
         }
         if (entry.state !== st) this._setState(entry, st);
       }
@@ -298,6 +309,150 @@ class DownloadManager {
     entry.finishedAt = new Date().toISOString();
     log(`[DL] http concluído: ${entry.gameName} (${(entry._http.downloaded / 1e9).toFixed(2)} GB)`);
     this._setState(entry, 'done');
+    this._postDownload(entry);
+  }
+
+  // ---------- Pós-download: extrai arquivos / instala setups ----------
+  //
+  // Jogos chegam como: arquivos compactados (zip/rar/7z/split) OU setup.exe
+  // (repacks Inno/NSIS). O fluxo é: extrai/instala mostrando % no app,
+  // depois apaga os arquivos-fonte. Estado 'installing' → 'ready'.
+
+  _sevenZip() {
+    const exe = path.join(process.env.UBIKA_BASE_DIR || __dirname, 'tools', '7za.exe');
+    return fs.existsSync(exe) ? exe : null;
+  }
+
+  /** Varre a pasta do jogo e separa arquivos compactados de instaladores. */
+  _scanInstallables(dir) {
+    const archives = [];
+    const archiveVolumes = []; // partes de volume p/ apagar depois
+    const setups = [];
+    const walk = (d, depth) => {
+      if (depth > 3) return;
+      let ents;
+      try { ents = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+      for (const e of ents) {
+        const p = path.join(d, e.name);
+        if (e.isDirectory()) { walk(p, depth + 1); continue; }
+        const n = e.name.toLowerCase();
+        if (/\.part0*1\.rar$/.test(n)) { archives.unshift(p); continue; } // primeiro volume vai na frente
+        if (RAR_PART_RE.test(n) && !n.endsWith('.rar')) { archiveVolumes.push(p); continue; }
+        if (ARCHIVE_RE.test(n)) { archives.push(p); continue; }
+        if (/\.part\d+\.rar$/.test(n)) { archiveVolumes.push(p); continue; }
+        if (/\.(r\d{2,}|z\d{2,}|7z\.\d{3,}|zip\.\d{3,})$/.test(n)) { archiveVolumes.push(p); continue; }
+        if (/\.exe$/i.test(n) && SETUP_RE.test(n)) setups.push(p);
+      }
+    };
+    walk(dir, 0);
+    return { archives, archiveVolumes, setups };
+  }
+
+  /** Extrai um arquivo com 7za, reportando % pelo stdout ("  45% 123 - file"). */
+  _extractArchive(archivePath, outDir, onPct) {
+    return new Promise((resolve) => {
+      const sz = this._sevenZip();
+      if (!sz) return resolve({ ok: false, error: '7za.exe ausente' });
+      const child = spawn(sz, ['x', archivePath, `-o${outDir}`, '-y', '-bsp1'], { windowsHide: true });
+      let tail = '';
+      const onData = (d) => {
+        tail = (tail + d.toString('utf8')).slice(-4000);
+        const m = tail.match(/(\d+)%/g);
+        if (m) onPct(parseInt(m[m.length - 1], 10));
+      };
+      child.stdout.on('data', onData);
+      child.stderr.on('data', onData);
+      child.on('error', err => resolve({ ok: false, error: err.message }));
+      child.on('close', code => resolve({ ok: code === 0 || code === 1, error: code > 1 ? `7za exit ${code}` : null }));
+    });
+  }
+
+  /** Roda um instalador em modo silencioso (Inno Setup → fallback NSIS). */
+  _runSetup(exePath, installDir) {
+    return new Promise((resolve) => {
+      const tryFlags = (args, label) => {
+        const child = spawn(exePath, args, { windowsHide: true });
+        const t0 = Date.now();
+        child.on('error', err => resolve({ ok: false, error: err.message }));
+        child.on('close', code => {
+          const secs = (Date.now() - t0) / 1000;
+          if (code === 0) return resolve({ ok: true, label });
+          // falhou rápido com Inno → tenta NSIS
+          if (label === 'inno' && secs < 60) {
+            log(`[INSTALL] inno falhou (exit ${code}) — tentando NSIS /S`);
+            return tryFlags(['/S', `/D=${installDir}`], 'nsis');
+          }
+          resolve({ ok: false, error: `setup exit ${code} (${label})` });
+        });
+      };
+      tryFlags(['/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', `/DIR=${installDir}`], 'inno');
+    });
+  }
+
+  /**
+   * Depois do download: varre a pasta, extrai arquivos (com %), roda
+   * setup silencioso se houver, apaga fontes e marca 'ready'.
+   */
+  async _postDownload(entry) {
+    if (entry._installQueued) return;
+    entry._installQueued = true;
+    const dir = entry.kind === 'http' ? path.dirname(entry.savePath) : entry.savePath;
+    if (!fs.existsSync(dir)) return;
+
+    try {
+      const { archives, archiveVolumes, setups } = this._scanInstallables(dir);
+      if (!archives.length && !setups.length) {
+        this._setState(entry, 'ready');
+        return;
+      }
+
+      entry.installProgress = 0;
+      this._setState(entry, 'installing');
+
+      // 1. Extração de arquivos compactados
+      for (let i = 0; i < archives.length; i++) {
+        const a = archives[i];
+        log(`[INSTALL] extraindo ${path.basename(a)} (${i + 1}/${archives.length})`);
+        const r = await this._extractArchive(a, dir, pct => {
+          entry.installProgress = Math.round(((i + pct / 100) / archives.length) * 100);
+          this._emitUpdate(entry);
+        });
+        if (!r.ok) {
+          log(`[INSTALL] extração falhou em ${path.basename(a)}: ${r.error}`);
+          return this._setState(entry, 'install_error', r.error);
+        }
+      }
+      // apaga arquivos + volumes de origem
+      for (const f of [...archives, ...archiveVolumes]) { try { fs.unlinkSync(f); } catch {} }
+      log(`[INSTALL] ${archives.length} arquivo(s) extraídos, fontes removidas`);
+
+      // 2. Instalador silencioso (setup.exe / install.exe)
+      const remaining = this._scanInstallables(dir);
+      const setup = remaining.setups[0] || setups[0];
+      if (setup) {
+        entry.installProgress = -1; // indeterminado — app mostra barra animada
+        this._emitUpdate(entry);
+        const installDir = path.join(dir, 'Game');
+        log(`[INSTALL] rodando setup silencioso: ${path.basename(setup)}`);
+        const r = await this._runSetup(setup, installDir);
+        if (!r.ok) {
+          log(`[INSTALL] setup falhou: ${r.error}`);
+          return this._setState(entry, 'install_error', r.error);
+        }
+        // apaga instalador + sidecars (setup-1.bin, install.dat…)
+        try { fs.unlinkSync(setup); } catch {}
+        for (const f of fs.readdirSync(dir)) {
+          if (SETUP_SIDECAR_RE.test(f)) { try { fs.unlinkSync(path.join(dir, f)); } catch {} }
+        }
+        log(`[INSTALL] setup concluído (${r.label}), instalador removido`);
+      }
+
+      entry.installProgress = 100;
+      this._setState(entry, 'ready');
+    } catch (err) {
+      log(`[INSTALL] erro pós-download: ${err.message}`);
+      this._setState(entry, 'install_error', err);
+    }
   }
 
   list() {
@@ -321,6 +476,7 @@ class DownloadManager {
       finishedAt: entry.finishedAt,
       error: entry.error,
       engine: this.engineName,
+      installProgress: entry.state === 'installing' ? (entry.installProgress ?? -1) : null,
     };
   }
 

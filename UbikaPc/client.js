@@ -128,14 +128,22 @@ function runPs(script, args) {
   }
 }
 
-/** App mandou a resolução do celular → prepara o display virtual já. */
-function applyClientResolution(payload) {
+/**
+ * App anunciou a resolução do celular. Por padrão só ARMAZENA — o display
+ * virtual só é anexado quando um jogo/stream real começa (attach=true),
+ * pra tela física nunca apagar sem jogo rodando.
+ */
+function applyClientResolution(payload, { attach = false } = {}) {
   const w = Number.parseInt(payload?.width, 10), h = Number.parseInt(payload?.height, 10);
   const fps = Math.min(120, Math.max(24, Number.parseInt(payload?.fps, 10) || 60));
   if (!w || !h || w < 320 || h < 240 || w > 8192 || h > 8192) return { ok: false, error: 'RES_INVALIDA' };
   state.clientRes = { width: w, height: h, fps };
   state.lastClientAt = Date.now();
   saveState();
+  if (!attach) {
+    log(`[CLIENTE] resolução ${w}x${h}@${fps} guardada (attach só no jogo/stream)`);
+    return { ok: true, stored: true, applied: state.clientRes };
+  }
   log(`[CLIENTE] resolução ${w}x${h}@${fps} — anexando display virtual`);
   if (!sunshine.vddInstalled()) {
     log('[CLIENTE] VDD ausente — resolução guardada; Sunshine aplica no stream');
@@ -269,7 +277,7 @@ async function executeCommand(payload, ack) {
         // Abriu jogo → ajusta o display pra resolução do celular (se já anunciada
         // ou enviada junto no payload). Sunshine repete no stream-start via prep_cmd.
         const resToApply = (payload?.width && payload?.height) ? payload : state.clientRes;
-        if (resToApply?.width) applyClientResolution(resToApply);
+        if (resToApply?.width) applyClientResolution(resToApply, { attach: true });
 
         // Somente executáveis explicitamente registrados no manifesto local do usuário.
         const cwd = manifest.workingDirectory || path.dirname(manifest.executable);
