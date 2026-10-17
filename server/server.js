@@ -613,6 +613,14 @@ io.on('connection', (socket) => {
     socket.to(`user:${userId}`).emit('controller_event', { ...data, userId });
   });
 
+  // App -> PC: estado do app (foreground + controle no celular) — libera o
+  // painel-console do PC só quando o celular está ligado no PC com app aberto
+  socket.on('app_state', (data) => {
+    const userId = socket.data.userId || data?.userId;
+    if (!userId) return;
+    socket.to(`user:${userId}`).emit('app_state', { ...data, userId });
+  });
+
   // App -> VPS -> PC : encaminha comando e devolve o ack do PC ao app
   socket.on('send_to_pc', (data, ack) => {
     const reply = typeof ack === 'function' ? ack : () => {};

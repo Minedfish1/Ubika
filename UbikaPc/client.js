@@ -101,8 +101,11 @@ function detectBestIp() {
 
 // ---------- Estado do cliente (o PC guarda as infos e continua sozinho) ----------
 const STATE_PATH = path.join(BASE_DIR, 'state.json');
-let state = { clientRes: null, lastClientAt: 0 };
+let state = { clientRes: null, lastClientAt: 0, appForeground: false, appGamepad: false };
 try { if (fs.existsSync(STATE_PATH)) state = { ...state, ...JSON.parse(fs.readFileSync(STATE_PATH, 'utf8')) }; } catch {}
+// Flags de sessão nunca sobrevivem a reboot
+state.appForeground = false;
+state.appGamepad = false;
 function saveState() {
   try { fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2)); } catch {}
 }
@@ -306,6 +309,44 @@ function pollGamepads() {
   );
 }
 if (process.platform === 'win32') setInterval(pollGamepads, 4000);
+
+// ---------- Console no PC: só abre com o celular plugado (USB/BT) + app aberto ----------
+// phoneLink: 'usb' (dispositivo portátil WPD) | 'bt' (periférico Bluetooth ligado) | null.
+// appForeground/appGamepad chegam pelo evento app_state do app (relay da VPS).
+// consoleActive = app aberto no celular E (cabo USB ou Bluetooth ou controle no app).
+let phoneLink = null;
+let panelShownForLink = false;
+
+function pollPhoneLink() {
+  require('child_process').exec(
+    'powershell -NoProfile -Command "$w=(Get-PnpDevice -Class WPD -Status OK -ErrorAction SilentlyContinue).Count; $b=(Get-PnpDevice -Class Bluetooth -Status OK -ErrorAction SilentlyContinue | Where-Object { $_.FriendlyName -notmatch \'enumerator|protocol|rfcomm|generic\' }).Count; if ($w -gt 0) { \'usb\' } elseif ($b -gt 0) { \'bt\' } else { \'none\' }"',
+    { timeout: 20000, windowsHide: true },
+    (err, out) => {
+      if (err) return;
+      const v = String(out).trim().toLowerCase();
+      phoneLink = v === 'usb' || v === 'bt' ? v : null;
+    }
+  );
+}
+if (process.platform === 'win32') setInterval(pollPhoneLink, 5000);
+
+function isConsoleActive() {
+  return Boolean(state.appForeground && (phoneLink || state.appGamepad));
+}
+
+// Destravou → abre o painel uma vez por sessão de conexão
+setInterval(() => {
+  const active = isConsoleActive();
+  if (active && !panelShownForLink) {
+    panelShownForLink = true;
+    log(`[CONSOLE] celular ligado (${phoneLink || 'app+controle'}) com app aberto — abrindo painel`);
+    if (process.platform === 'win32') {
+      require('child_process').exec(`cmd /c start "" "http://127.0.0.1:${Number(process.env.UBIKA_GUI_PORT) || 47890}"`, { windowsHide: true });
+    }
+  } else if (!active) {
+    panelShownForLink = false;
+  }
+}, 3000);
 
 // ---------- Comandos ----------
 function validateInstallPath(input) {
@@ -562,7 +603,17 @@ socket.on('pareado', (data) => {
 });
 
 // VPS avisa que o último app desse usuário saiu → restaura display se não há stream
-socket.on('cliente_offline', () => restoreDisplay('app desconectou'));
+socket.on('cliente_offline', () => {
+  state.appForeground = false;
+  state.appGamepad = false;
+  restoreDisplay('app desconectou');
+});
+
+// App avisa foreground/controle — junto com o link USB/BT destrava o painel-console
+socket.on('app_state', (data) => {
+  state.appForeground = Boolean(data?.foreground);
+  state.appGamepad = Boolean(data?.gamepad);
+});
 
 socket.on('connect_error', err => log(`[SOCKET] connect_error ${err.message}`));
 socket.on('disconnect', reason => log(`[SOCKET] desconectado reason=${reason}`));
@@ -734,6 +785,9 @@ try {
         librarySize: searchLibrary('', 1).total,
         downloads: downloads.list().slice(-5),
         downloadDir,
+        consoleActive: isConsoleActive(),
+        appForeground: Boolean(state.appForeground),
+        phoneLink,
         uptime: Math.floor(process.uptime()),
       };
     },
@@ -741,6 +795,13 @@ try {
     onAuth: guiAuth,
     onLogout: guiLogout,
     onSettings: guiSettings,
+    // Catálogo do painel — a mesma busca/instalação do app, mas no PC
+    onCatalog: (q) => {
+      try { const r = searchLibrary(String(q || ''), 1); return { ok: true, games: r.games.slice(0, 60), total: r.total }; }
+      catch (e) { return { ok: false, error: e.message }; }
+    },
+    onGameAction: (b) => new Promise((resolve) =>
+      executeCommand({ ...b, action: String(b?.action || '') }, resolve)),
   });
 } catch (err) {
   log(`[GUI] não subiu: ${err.message}`);

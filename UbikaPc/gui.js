@@ -43,12 +43,26 @@ const PAGE = `<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
   .d:hover{background:#1e0d33}
   .d:last-child{border-bottom:0}
   .d .i{opacity:.8}
+  .catgrid{display:flex;flex-direction:column;gap:8px;max-height:420px;overflow-y:auto;margin-top:8px}
+  .g{display:flex;gap:10px;background:#0d0418;border:1px solid #2a1750;border-radius:10px;padding:8px}
+  .g img{width:52px;height:68px;object-fit:cover;border-radius:6px;background:#1e0d33}
+  .g .gi{flex:1;min-width:0}
+  .g .t{font-size:13px;font-weight:800;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .g .s{font-size:11px;color:#8a7fa8;margin:2px 0 6px}
+  .g .act{display:flex;flex-direction:column;gap:4px;justify-content:center}
+  .g button{width:auto;padding:7px 12px;font-size:11px;margin:0;white-space:nowrap}
+  .g button.play{background:#2E7D32}
+  .g button.del{background:#3A0D10;color:#EF5350}
+  .g .ver{font-size:10px;color:#5a4a80;margin-top:2px}
+  .lockbox{text-align:center;padding:18px 6px;color:#8a7fa8;font-size:13px;line-height:1.7}
+  .lockbox .lk{font-size:30px;margin-bottom:8px}
 </style></head><body>
 <h1>UBIKA PC</h1>
 <div class="sub" id="dev">—</div>
 
 <div class="card"><h2>CONTA</h2><div id="acct">…</div></div>
 <div class="card"><div id="main"></div></div>
+<div class="card" id="concard"><h2>CATÁLOGO</h2><div id="console"></div></div>
 <div class="card"><h2>STATUS</h2><div id="rows"></div></div>
 <div class="card"><h2>CONFIGURAÇÕES</h2>
   <div class="mut" style="font-size:12px;margin-bottom:6px">Pasta dos jogos</div>
@@ -144,6 +158,50 @@ async function speedTest(){
   }catch(e){o.innerHTML='<span class="bad">Falhou: '+e.message+'</span>'}
   b.disabled=false;
 }
+// ---------- Console: catálogo só com celular ligado (USB/BT) + app aberto ----------
+let catQ='',catGames=[],catLock=false;
+async function loadCatalog(){
+  const r=await (await fetch('/api/catalog?q='+encodeURIComponent(catQ))).json();
+  if(!r.ok)return;
+  catGames=r.games||[];renderCatalog();
+}
+function renderCatalog(){
+  if(catLock)return;
+  console.innerHTML='<input id="cq" placeholder="Buscar jogo…" style="width:100%" oninput="catQ=this.value" onkeydown="if(event.key===\'Enter\')loadCatalog()">'+
+    '<button onclick="loadCatalog()">BUSCAR</button>'+
+    '<div class="catgrid">'+catGames.map(function(g,i){
+      var acts='';
+      if(g.installed&&g.playable)
+        acts='<button class="play" onclick="gAct('+i+',\'launch\')">▶ JOGAR</button>'+
+             '<button class="del" onclick="gAct('+i+',\'excluir_jogo\',1)">🗑</button>';
+      else if(g.installed)
+        acts='<span class="ver">instalado (sem exe)</span>'+
+             '<button class="del" onclick="gAct('+i+',\'excluir_jogo\',1)">🗑</button>';
+      else
+        acts=(g.versions||[]).map(function(v,vi){
+          return '<button onclick="gDl('+i+','+vi+')">⬇ '+esc(v.source||'fonte')+(v.size?' · '+esc(v.size):'')+'</button>';
+        }).join('');
+      return '<div class="g"><img src="'+esc(g.coverUrl||'')+'" onerror="this.style.visibility=\'hidden\'">'+
+        '<div class="gi"><div class="t">'+esc(g.title)+'</div>'+
+        '<div class="s">'+(g.installed?'✓ instalado':'')+'</div>'+
+        (g.versions||[]).map(function(v){return '<div class="ver">'+esc(v.source||'')+'</div>'}).join('')+
+        '</div><div class="act">'+acts+'</div></div>';
+    }).join('')+'</div>';
+  var q=document.getElementById('cq');q.value=catQ;
+}
+async function gDl(i,vi){
+  var g=catGames[i],v=(g.versions||[])[vi];if(!v)return;
+  var r=await (await fetch('/api/game_action',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({action:'iniciar_download',gameName:g.title,magnetLink:v.magnet||'',link:(v.links&&v.links[0])||'',coverUrl:g.coverUrl})})).json();
+  document.getElementById('setmsg').innerHTML=r.ok?'<span class="ok">✓ '+esc(g.title)+' baixando</span>':'<span class="bad">'+esc(r.error||'Erro')+'</span>';
+}
+async function gAct(i,action,confirm){
+  var g=catGames[i];
+  if(confirm&&!window.confirm('Apagar "'+g.title+'" do PC?'))return;
+  var r=await (await fetch('/api/game_action',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({action:action,installId:g.installId})})).json();
+  if(action==='excluir_jogo'&&r.ok)loadCatalog();
+}
 async function tick(){
   try{
     const s=await (await fetch('/status.json')).json();
@@ -166,6 +224,17 @@ async function tick(){
     r('Uptime','<span class="mut">'+Math.floor(s.uptime/60)+'min</span>');
     if(document.activeElement!==dir) dir.value=s.downloadDir||'';
     dl.innerHTML=(s.downloads||[]).map(d=>esc(d.gameName)+': '+(d.progress||0)+'%'+(d.state==='done'?' ✓':'')).join('<br>');
+    // Console: só libera o catálogo com o celular ligado no PC + app aberto
+    const wasLock=catLock;catLock=!s.consoleActive;
+    if(catLock){
+      console.innerHTML='<div class="lockbox"><div class="lk">🔌</div>'+
+        'Conecte o celular por <b>USB</b> ou <b>Bluetooth</b><br>com o app Ubika aberto para liberar o catálogo'+
+        (s.appForeground?'<br><span class="mut" style="font-size:11px">app aberto ✓ · aguardando link USB/Bluetooth…</span>':'')+
+        '</div>';
+    }else{
+      if(wasLock||!document.getElementById('cq'))renderCatalog();
+      if(!catGames.length)loadCatalog();
+    }
   }catch(e){}
 }
 tick();setInterval(tick,3000);
@@ -214,6 +283,14 @@ function startGui(port, handlers) {
 
     if (url.pathname === '/status.json') return json(handlers.getState());
     if (url.pathname === '/api/dirs') return json(listDirs(url.searchParams.get('path') || ''));
+    if (url.pathname === '/api/catalog' && handlers.onCatalog) {
+      try { return json(await handlers.onCatalog(url.searchParams.get('q') || '')); }
+      catch (e) { return json({ ok: false, error: e.message }); }
+    }
+    if (url.pathname === '/api/game_action' && req.method === 'POST' && handlers.onGameAction) {
+      const b = await readBody(req);
+      try { return json(await handlers.onGameAction(b)); } catch (e) { return json({ ok: false, error: e.message }); }
+    }
 
     if (url.pathname === '/speedtest' && req.method === 'POST' && handlers.onSpeedTest) {
       try { return json(await handlers.onSpeedTest()); }
